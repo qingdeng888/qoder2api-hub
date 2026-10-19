@@ -279,10 +279,34 @@ def main():
           acc_ban.enabled is False and acc_ban.auto_disabled_for() > 7000,
           (acc_ban.enabled, acc_ban.auto_disabled_for()))
 
+    # ---- 模型级冷却要能在面板看到（否则「可用」却打不通）----
+    tmp5 = tempfile.mkdtemp(prefix="qd-403-mcd-")
+    try:
+        acc = A.Account({"uid": "mcd-1", "realm": "intl",
+                         "accessToken": "dt-x"})
+        acc.model_cooldowns["Qwen3.8-Max"] = time.time() + 7200
+        acc.model_cooldowns["Expired-Model"] = time.time() - 10
+        view = acc.public()
+        check("public() 暴露模型级冷却",
+              "Qwen3.8-Max" in (view.get("modelCooldowns") or {}),
+              view.get("modelCooldowns"))
+        check("已过期的模型冷却不再展示",
+              "Expired-Model" not in (view.get("modelCooldowns") or {}),
+              view.get("modelCooldowns"))
+        check("账号本身仍可用（模型冷却不影响 enabled）",
+              view["enabled"] is True and view["autoDisabledFor"] == 0,
+              (view["enabled"], view["autoDisabledFor"]))
+        check("模型冷却剩余约 7200s",
+              (view.get("modelCooldowns") or {}).get("Qwen3.8-Max", 0) > 7100,
+              view.get("modelCooldowns"))
+    finally:
+        shutil.rmtree(tmp5, ignore_errors=True)
+
     html = open(os.path.join(ROOT, "dashboard.html"), encoding="utf-8").read()
     check("面板展示自动禁用状态",
           "autoDisabledFor" in html and "自动禁用" in html)
     check("面板说明会自动恢复", "自动恢复启用" in html)
+    check("面板展示模型级冷却", "modelCooldowns" in html and "模型冷却中" in html)
 
     print("")
     print("SUMMARY: TOTAL %d checks, %d passed, %d failed"

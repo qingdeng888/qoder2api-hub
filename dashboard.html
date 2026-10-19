@@ -2738,6 +2738,22 @@ function accountRow(a){
               : a.inCooldown ? '<span class="badge warn">冷却 ' + fmtWait(a.cooldownFor || 0) + '</span>'
               : a.expiresIn === 'expired' ? '<span class="badge bad">已过期</span>'
               : '<span class="badge ok">可用</span>';
+  // 模型级冷却（403 code 112 等）：账号本身可用，但某些模型在冷却中。
+  // 之前完全不展示，导致用户看到「可用」却打不通，以为冷却没生效。
+  const modelCd = a.modelCooldowns || {};
+  const modelCdNames = Object.keys(modelCd);
+  let modelCdNote = '';
+  if(modelCdNames.length){
+    const items = modelCdNames.slice(0, 4).map(name =>
+      '<span class="mono" style="font-size:10px">' + esc(name) + '</span> '
+      + fmtWait(modelCd[name])).join(' · ');
+    modelCdNote = '<div class="hint" style="color:var(--warn);margin:2px 0 0" '
+      + 'title="这些模型在上游返回 403（如需付费套餐），只停该模型，不影响账号其它模型">'
+      + '模型冷却中：' + items
+      + (modelCdNames.length > 4 ? ' 等 ' + modelCdNames.length + ' 个' : '')
+      + '</div>';
+  }
+  window.__modelCdNote = modelCdNote;
   if(autoOff){
     // 让「为什么被禁、还剩多久、会不会自己好」一眼可读
     const note = '<div class="hint" style="color:var(--warn);margin:2px 0 0">'
@@ -2796,6 +2812,7 @@ function accountRow(a){
     + '<div class="mono" style="color:var(--dim);font-size:11px">' + esc(a.uid.slice(0,8)) + ' · ' + esc(a.source) + ' · 到期 ' + esc(a.expiresIn || '?') + '</div>'
     + remarkLine
     + (window.__autoOffNote || '')
+    + (window.__modelCdNote || '')
     + (a.machineId ? ('<div class="mono" style="color:var(--dim);font-size:10px;margin-top:2px" title="由账号UID稳定派生的专属设备码，防多号关联风控">设备码: ' + esc(a.machineId.slice(0,14)) + '...</div>') : '')
     + err + '</td>'
     + '<td style="text-align:center">' + state + '</td>'

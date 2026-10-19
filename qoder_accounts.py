@@ -1421,6 +1421,9 @@ class Account(object):
             # 403 自动禁用：面板显示「自动禁用 x 分钟」并提示会自动恢复
             "autoDisabledFor": self.auto_disabled_for(),
             "autoDisabledReason": self.disabled_reason or "",
+            # 模型级冷却（如 403 code 112 只停某个模型 2 小时）：面板要能看到，
+            # 否则账号显示「可用」而某个模型其实打不通，用户会以为冷却没生效。
+            "modelCooldowns": self.model_cooldowns_view(),
             "source": self.source,
             "proxyMode": self.proxy_mode or "",
             "proxyId": self.proxy_id or "",
@@ -1776,6 +1779,18 @@ class Account(object):
             except Exception:
                 pass
         return True
+
+    def model_cooldowns_view(self):
+        """{model: 剩余秒数}，只保留仍在生效的条目（过期项不展示）。"""
+        now = time.time()
+        out = {}
+        for name, deadline in list(self.model_cooldowns.items()):
+            left = int(deadline - now)
+            if left > 0:
+                out[name] = left
+            else:
+                self.model_cooldowns.pop(name, None)
+        return out
 
     def auto_disabled_for(self):
         """自动禁用剩余秒数（0 = 未处于自动禁用）。"""

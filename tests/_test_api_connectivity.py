@@ -112,6 +112,8 @@ def main():
             "paid-model", "test", max_tokens=16, port=port)
         check("上游 403 -> ok=False / status=403",
               not failed["ok"] and failed["status"] == 403, failed)
+        # 诊断跑完后，真实上游 403 必须留下可观测的冷却痕迹，否则「为什么没冷却」
+        # 永远只能靠翻日志猜。这里只断言 403 原样透出，冷却由 403 套件覆盖。
         check("上游错误消息透传", "付费" in (failed.get("error") or ""),
               failed.get("error"))
 
