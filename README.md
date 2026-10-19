@@ -119,6 +119,9 @@ docker compose up -d
 
 # 2. 查看网关日志
 docker compose logs -f
+
+# 只拉镜像（不启动）：
+docker pull ghcr.io/qingdeng888/qoder2api-hub:latest
 ```
 
 > **首次使用 fork 的 Actions**：到 `Settings → Actions → General` 允许 workflows；推送到 `main` 后会自动触发，也可以在 [Actions 页面](https://github.com/qingdeng888/qoder2api-hub/actions/workflows/docker-publish.yml) 手动 `Run workflow`。
