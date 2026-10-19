@@ -8255,6 +8255,24 @@ class Handler(BaseHTTPRequestHandler):
                                    "enabled" if payload.get("enabled")
                                    else "disabled"))
             return self._json(200, {"account": updated})
+        if path == "/accounts/remark":
+            uid = str(payload.get("uid") or "").strip()
+            if not uid:
+                return self._error(400, "uid required")
+            remark = payload.get("remark")
+            if remark is None:
+                remark = payload.get("note")
+            if isinstance(remark, str) and len(remark) > 120:
+                return self._error(400, "备注最多 120 个字符",
+                                   "invalid_request_error")
+            try:
+                updated = POOL.set_remark(uid, remark or "")
+            except KeyError:
+                return self._error(404, "no such account")
+            log("account %s remark set (%d chars)"
+                % (uid[:8], len(updated.get("remark") or "")))
+            return self._json(200, {"ok": True, "account": updated,
+                                    "accounts": account_views()})
         if path == "/accounts/set-all":
             POOL.set_all_enabled(bool(payload.get("enabled")))
             return self._json(200, {"accounts": account_views()})

@@ -1298,6 +1298,8 @@ class Account(object):
                             or "").strip()
         if self.proxy_mode != "bind":
             self.proxy_id = ""
+        # 账号备注（纯本地展示用，不上行、不影响路由）：方便区分「哪个号是哪个」。
+        self.remark = str(data.get("remark") or data.get("note") or "").strip()[:120]
         self.last_error = str(data.get("lastError") or "")
         self.cooldown_until = float(data.get("cooldownUntil") or 0)
         # 按模型粒度的限流冷却：上游频控只针对单模型，不能拖垮整个账号。
@@ -1385,6 +1387,7 @@ class Account(object):
             "enabled": self.enabled,
             "proxyMode": self.proxy_mode,
             "proxyId": self.proxy_id,
+            "remark": self.remark,
             "lastError": self.last_error,
             "cooldownUntil": self.cooldown_until,
             "credits": self.credits,
@@ -1411,6 +1414,7 @@ class Account(object):
             "source": self.source,
             "proxyMode": self.proxy_mode or "",
             "proxyId": self.proxy_id or "",
+            "remark": self.remark or "",
             "tokenFamily": token_family(self),
             "expiresAt": exp,
             "expiresIn": _human_delta(exp - time.time()) if exp else None,
@@ -3549,6 +3553,17 @@ class AccountPool(object):
         account.save(self.dir)
         return account.public()
 
+    def set_remark(self, uid, remark):
+        """更新账号备注（纯本地字段）并落盘；返回 public()。"""
+        text = str(remark or "").strip()[:120]
+        with self._lock:
+            account = self.get(uid)
+            if account is None:
+                raise KeyError(uid)
+            account.remark = text
+            account.save(self.dir)
+            return account.public()
+
     def set_all_enabled(self, enabled, realm=None):
         with self._lock:
             for account in self.accounts:
@@ -4192,6 +4207,10 @@ def normalise_import_row(row, realm=None):
         "userType": str(pick("userType") or "") or DEFAULT_USER_TYPE,
         "organizationId": str(pick("organizationId") or ""),
         "organizationName": str(pick("organizationName") or ""),
+        # 本地管理字段：备注与出口绑定随导出/导入往返保留（运行期状态仍然重置）
+        "remark": str(pick("remark") or "")[:120],
+        "proxyMode": str(pick("proxyMode") or "").strip().lower(),
+        "proxyId": str(pick("proxyId") or "").strip(),
         "lastError": "",
         "cooldownUntil": 0.0,
     }

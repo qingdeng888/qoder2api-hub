@@ -465,6 +465,7 @@ custom freeform 工具（`apply_patch`）自动降级为 function 工具出站�
 | POST | /accounts/login/start | 发起 OAuth 设备授权 |
 | POST | /accounts/import/pat | 导入 PAT 令牌 |
 | POST | /accounts/checkin | 手动签到（单个/全部） |
+| POST | /accounts/remark | 设置账号备注（纯本地展示字段，最多 120 字，可留空清除） |
 
 ---
 

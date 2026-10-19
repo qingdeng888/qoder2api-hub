@@ -2745,11 +2745,21 @@ function accountRow(a){
     else txt = '更新于 ' + esc((a.creditsUpdatedIso || '').slice(5,16) || '未知');
     freshLine = '<div class="mono" style="font-size:10px;color:var(--dim);margin-top:2px">' + txt + '</div>';
   }
+  // 备注：纯本地字段（不上行），用来区分同名的多个号
+  const remark = String(a.remark || '');
+  const remarkLine = remark
+    ? '<div style="font-size:12px;color:var(--accent2);margin-top:2px;word-break:break-word">'
+      + '<span title="备注（仅本地）">📝 ' + esc(remark) + '</span>'
+      + '<button class="sec mini" style="margin-left:6px;padding:0 6px;font-size:10px" '
+      +   'onclick="editAccountRemark(&quot;' + uidAttr + '&quot;, this)">改</button></div>'
+    : '<div style="margin-top:2px"><button class="sec mini" style="padding:0 6px;font-size:10px;color:var(--dim)" '
+      +   'onclick="editAccountRemark(&quot;' + uidAttr + '&quot;, this)">＋ 添加备注</button></div>';
   return '<tr>'
     + '<td style="text-align:center;white-space:nowrap">' + realmBadge + '</td>'
     + '<td style="text-align:left">'
     +   '<div style="font-weight:600;font-size:13px;color:var(--fg)">' + esc(a.nickname) + '</div>'
     + '<div class="mono" style="color:var(--dim);font-size:11px">' + esc(a.uid.slice(0,8)) + ' · ' + esc(a.source) + ' · 到期 ' + esc(a.expiresIn || '?') + '</div>'
+    + remarkLine
     + (a.machineId ? ('<div class="mono" style="color:var(--dim);font-size:10px;margin-top:2px" title="由账号UID稳定派生的专属设备码，防多号关联风控">设备码: ' + esc(a.machineId.slice(0,14)) + '...</div>') : '')
     + err + '</td>'
     + '<td style="text-align:center">' + state + '</td>'
@@ -2771,6 +2781,25 @@ function accountRow(a){
     +   '</div>'
     + '</div>'
     + '</td></tr>';
+}
+
+async function editAccountRemark(uid, btn){
+  const list = window.ACCOUNTS || [];
+  const account = list.find(a => String(a.uid).startsWith(String(uid))) || {};
+  const current = String(account.remark || '');
+  const input = window.prompt('给这个账号加个备注（仅本地显示，最多 120 字）:', current);
+  if(input === null) return;            // 取消
+  if(btn){ btn.disabled = true; }
+  try{
+    const r = await postJSON('/accounts/remark', {uid: account.uid || uid, remark: input});
+    if(r.accounts) window.ACCOUNTS = r.accounts;
+    renderAccounts();
+    toast(input.trim() ? '备注已保存' : '备注已清除', 'ok');
+  }catch(e){
+    toast('保存备注失败: ' + e.message, 'bad');
+  }finally{
+    if(btn){ btn.disabled = false; }
+  }
 }
 
 function renderAccounts(){
