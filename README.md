@@ -124,7 +124,7 @@ docker compose logs -f
 docker pull ghcr.io/qingdeng888/qoder2api-hub:latest
 ```
 
-> **首次使用 fork 的 Actions**：到 `Settings → Actions → General` 允许 workflows；推送到 `main` 后会自动触发，也可以在 [Actions 页面](https://github.com/qingdeng888/qoder2api-hub/actions/workflows/docker-publish.yml) 手动 `Run workflow`。
+> **首次使用 fork 的 Actions**：到 `Settings → Actions → General` 允许 workflows（或在 Actions 页点击 “I understand my workflows, go ahead and enable them”）；推送到 `main` 后会自动触发，也可以在 [Actions 页面](https://github.com/qingdeng888/qoder2api-hub/actions/workflows/docker-publish.yml) 手动 `Run workflow`。
 >
 > **GHCR 包默认是私有的**：如果 `docker compose pull` 提示 denied，先登录（PAT 需要 `read:packages`）：
 > ```bash
