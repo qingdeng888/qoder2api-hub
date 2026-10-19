@@ -771,7 +771,8 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <div>
         <div style="font-size:12px;color:var(--dim);margin-bottom:4px">测试模型</div>
         <select id="apiTestModel" style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;color:var(--fg);font:inherit">
-          <option value="">（模型清单加载中…）</option>
+          <!-- 首个选项就是固定默认：清单没加载完也已经是 Qwen3.8-Flash -->
+          <option value="Qwen3.8-Flash" selected>Qwen3.8-Flash · 免费（默认）</option>
         </select>
         <div id="apiTestModelHint" style="font-size:11px;color:var(--dim);margin-top:4px"></div>
       </div>
@@ -2002,15 +2003,14 @@ function renderApiTestModels(){
     const suffix = m.enabled === false ? ' · 未开通' : (m.is_free ? ' · 免费' : '');
     return '<option value="' + esc(m.id) + '">' + esc(m.id) + suffix + '</option>';
   }).join('');
+  // 默认永远钉在免费模型上：pinned -> 同族免费 -> 任意免费 -> pinned（即使
+  // 清单里暂时没有也不改用付费模型，交给上游报错比静默换模型更好排查）。
   let defaultId = '';
-  if(list.some(m => m.id === pinned && m.enabled !== false)) defaultId = pinned;
+  if(freeIds.indexOf(pinned) >= 0) defaultId = pinned;
   if(!defaultId) defaultId = (freeIds.find(isPreferred) || freeIds[0] || '');
-  if(!defaultId){
-    const usable = list.find(m => m.enabled !== false) || list[0];
-    defaultId = usable ? usable.id : '';
-  }
-  if(prev && list.some(m => m.id === prev)) sel.value = prev;
-  else if(defaultId) sel.value = defaultId;
+  if(!defaultId) defaultId = pinned;
+  if(prev && prev === defaultId && list.some(m => m.id === prev)) sel.value = prev;
+  else sel.value = defaultId;
   if(state) state.textContent = '(' + list.length + ' 个模型)';
   if(hint){
     const chosen = list.find(m => m.id === sel.value);

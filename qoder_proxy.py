@@ -8621,7 +8621,10 @@ class Handler(BaseHTTPRequestHandler):
             account = POOL.get(uid)
             if not account:
                 return self._error(404, "no such account")
-            test_model = payload.get("model") or "auto"
+            # 账号体检同样默认用免费模型：auto/付费模型会因选到需要套餐的模型
+            # 而误报失败，掩盖「这个账号到底能不能用」。
+            test_model = resolve_diag_model(
+                payload.get("model"), realm=acc_realm(account))
             test_payload = {
                 "model": test_model,
                 "messages": [{"role": "user", "content": "hi"}],

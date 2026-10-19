@@ -80,6 +80,16 @@ def main():
     for token in ("DIAG_DEFAULT_MODEL", "freeIds", "不消耗付费额度",
                   "诊断默认使用免费模型"):
         check("面板接线: %s" % token, token in html)
+    check("下拉静态首项就是 Qwen3.8-Flash（清单未加载时也正确）",
+          '<option value="Qwen3.8-Flash" selected>' in html)
+    check("默认不会被付费模型顶掉（钉在免费模型上）",
+          "defaultId = pinned" in html)
+    # /accounts/test 也必须默认免费模型，而不是 auto
+    src = io.open(os.path.join(ROOT, "qoder_proxy.py"),
+                  encoding="utf-8").read()
+    check("/accounts/test 默认使用免费诊断模型",
+          'test_model = resolve_diag_model(' in src
+          and 'test_model = payload.get("model") or "auto"' not in src)
     check("面板不再因空模型直接 return",
           "toast('请选择测试模型'" not in html)
 

@@ -140,9 +140,9 @@ def main():
               P.DIAG_DEFAULT_MODEL == "Qwen3.8-Flash", P.DIAG_DEFAULT_MODEL)
 
         explicit = P.run_api_connectivity_test(
-            "Qwen3.8-Max", "test", max_tokens=16, port=port)
+            "paid-model", "test", max_tokens=16, port=port)
         check("显式指定模型时不被默认值覆盖",
-              explicit.get("model") == "Qwen3.8-Max", explicit.get("model"))
+              explicit.get("model") == "paid-model", explicit.get("model"))
 
         closed = P.run_api_connectivity_test(
             "Qwen3.8-Flash", "test", max_tokens=16, port=1)
