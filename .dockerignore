@@ -20,3 +20,5 @@ usage/
 .mimosa/
 _shots/
 umid/
+.env
+.env.local

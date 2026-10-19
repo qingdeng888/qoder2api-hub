@@ -270,8 +270,11 @@ def main():
         check("无 scheme 的地址补成 http://",
               PP.normalize_proxy_url("127.0.0.1:9002")
               == "http://127.0.0.1:9002")
-        mode = oct(os.stat(PP.config_path()).st_mode & 0o777)
-        check("配置文件权限 0600", mode == "0o600", mode)
+        if os.name == "nt":
+            print("  [SKIP] 配置文件权限 0600（Windows 不适用）")
+        else:
+            mode = oct(os.stat(PP.config_path()).st_mode & 0o777)
+            check("配置文件权限 0600", mode == "0o600", mode)
 
         PP.update_config({"enabled": True, "mode": "rotate",
                           "health_check": {"enabled": False,

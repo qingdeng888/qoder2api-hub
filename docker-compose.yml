@@ -1,10 +1,12 @@
 services:
   qoder-proxy:
-    # 本地源码构建（已加入出站代理池）；官方预构建镜像不含本次补丁。
-    # 升级上游版本：重新 `docker compose build --pull && docker compose up -d`
-    image: qoder2api-hub:proxy-pool
-    build:
-      context: .
+    # 使用本 fork 自动构建的镜像：每次 push main 后 GitHub Actions 推送
+    # ghcr.io/qingdeng888/qoder2api-hub:latest。
+    # 拉取：docker compose pull && docker compose up -d
+    # 想改成本地源码构建：注释 image，取消 build 的注释。
+    image: ghcr.io/qingdeng888/qoder2api-hub:latest
+    # build:
+    #   context: .
     container_name: qoder-proxy
     restart: unless-stopped
     ports:

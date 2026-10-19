@@ -7,6 +7,8 @@
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
   <img src="https://img.shields.io/badge/License-MIT-green.svg?style=flat-square" alt="License">
   <img src="https://img.shields.io/badge/Zero-Dependency-ff69b4?style=flat-square" alt="Zero Dependency">
+  <a href="https://github.com/qingdeng888/qoder2api-hub/actions/workflows/docker-publish.yml"><img src="https://github.com/qingdeng888/qoder2api-hub/actions/workflows/docker-publish.yml/badge.svg?branch=main" alt="Build Docker image"></a>
+  <a href="https://github.com/qingdeng888/qoder2api-hub/actions/workflows/tests.yml"><img src="https://github.com/qingdeng888/qoder2api-hub/actions/workflows/tests.yml/badge.svg?branch=main" alt="tests"></a>
 </p>
 
 本项目为 **Qoder2API-Hub**，将阿里 **[qoder.com.cn](https://qoder.com.cn)** (国内版) 与 **[qoder.com](https://qoder.com)** (国际版) 的原生服务封装为标准 OpenAI 兼容接口，支持 Chat Completions 与 Responses API。具备多账号负载轮询、稳定物理设备指纹隔离、OAuth 设备授权一键免客户端登录、每日签到与实时额度查询、Pro 福利包自动领取、后台常驻定时调度器、Web 监控看板等全套能力 —— 与 WorkBuddy2API-Hub 同构的完整功能矩阵。
@@ -101,7 +103,14 @@
 
 ### 5. Docker 容器化部署
 
-**方式一：官方预构建镜像（推荐）**。每个版本会自动构建并推送多架构（amd64 / arm64）镜像到 GHCR，升级只要 `pull`：
+**方式一：本 fork 自动构建镜像（推荐）**。每次 push 到 `main`，GitHub Actions 的 `Build Docker image` 会自动构建多架构（amd64 / arm64）镜像并推送到：
+
+```text
+ghcr.io/qingdeng888/qoder2api-hub:latest
+ghcr.io/qingdeng888/qoder2api-hub:sha-<短提交>
+```
+
+打 `v*` tag 时还会追加 `1.5.2`、`1.5` 等语义化版本标签。`docker-compose.yml` 默认已指向该镜像：
 
 ```bash
 # 1. 拉取并启动
@@ -112,7 +121,15 @@ docker compose up -d
 docker compose logs -f
 ```
 
-**方式二：从源码自行构建**。把 `docker-compose.yml` 里的 `image:` 注释掉、改用 `build: .`：
+> **首次使用 fork 的 Actions**：到 `Settings → Actions → General` 允许 workflows；推送到 `main` 后会自动触发，也可以在 [Actions 页面](https://github.com/qingdeng888/qoder2api-hub/actions/workflows/docker-publish.yml) 手动 `Run workflow`。
+>
+> **GHCR 包默认是私有的**：如果 `docker compose pull` 提示 denied，先登录（PAT 需要 `read:packages`）：
+> ```bash
+> echo "$CR_PAT" | docker login ghcr.io -u qingdeng888 --password-stdin
+> ```
+> 或者到 [包设置](https://github.com/users/qingdeng888/packages/container/qoder2api-hub/settings) 把 visibility 改为 Public。
+
+**方式二：本地源码构建**。把 `docker-compose.yml` 里的 `image:` 注释掉、取消 `build:` 的注释：
 
 ```bash
 docker compose up -d --build
@@ -123,58 +140,12 @@ docker compose up -d --build
 ```bash
 docker run -d --name qoder-proxy --restart unless-stopped \
   -p 8790:8790 -v $(pwd)/accounts:/app/accounts -v $(pwd)/usage:/app/usage \
-  -e API_KEY=your_secret_key ghcr.io/shuishuipingan/qoder2api-hub:latest
+  -e API_KEY=your_secret_key ghcr.io/qingdeng888/qoder2api-hub:latest
 ```
 
-> **镜像与版本入口**：[**GHCR 包页面**](https://github.com/shuishuipingan/qoder2api-hub/pkgs/container/qoder2api-hub)（列出全部可用 tag、架构与拉取命令）· [**Releases**](https://github.com/shuishuipingan/qoder2api-hub/releases)（每个版本的变更说明）。
+> **镜像与构建入口**：[**GHCR 包页面**](https://github.com/qingdeng888/qoder2api-hub/pkgs/container/qoder2api-hub)（tag、架构、拉取命令）· [**Releases**](https://github.com/qingdeng888/qoder2api-hub/releases) · [**Build Docker image**](https://github.com/qingdeng888/qoder2api-hub/actions/workflows/docker-publish.yml)（每次 push main 自动构建）。
 >
-> 可用 tag：**`latest`** · **`1.3`**（跟随最新 1.3.x）· **具体版本**（如 `1.3.3`）· **`sha-<短提交>`**（钉死某次构建）。镜像为 **linux/amd64 + linux/arm64** 双架构。
->
-> 提示：GitHub 仓库**首页侧栏**未必列出容器包 —— 用上面那个包页面链接即可，或直接 `docker pull ghcr.io/shuishuipingan/qoder2api-hub:latest`。
-
-```
-
-- **持久化目录**：`./accounts`（账号凭证及出口设置）与 `./usage`（请求流水与指标快照）；
-- **配置参数**：环境变量 `API_KEY`、`PORT`（监听端口，默认 8790）、`HOST`（监听地址，默认 127.0.0.1；容器内如需对外暴露设为 0.0.0.0）。
-
-> **设备身份稳定性（issue #18 实测 + v1.2.13 起根治）**：容器里的机器身份是**「容器级」**的——默认 `bridge` 网络下**重启即换**（含 `docker compose restart` 与宿主机重启后自动拉起），任何网络模式下**重建即换**。若你依赖「每台设备每日限领」这类按设备去重的规则，**只要 `accounts/` 是挂载卷，v1.2.13 起默认就已根治**（见下 ①）。注意：**推理 / API 链路不受影响**，它用的是按账号 UID 派生的身份。
->
-> **① 机器身份落盘缓存（v1.2.13 起默认启用 —— 根治「重建 / 升级必换」）**
-> 网关会把官方组件**首次输出的**身份缓存到 `accounts/machine_identity.json`，之后**优先复用**：重建、升级、重启容器后设备身份**保持不变**。
->
-> - **前提**：`accounts/` **必须是挂载卷**（不挂卷时缓存写在容器内部、随容器消亡，等于没缓存）；
-> - 缓存的是**官方组件自己的输出**，不是伪造；
-> - ⚠️ **更正（v1.2.16，据 issue #18 的实测）**：组件**会**落状态文件 —— 它在 `$HOME/.config/.locale_cfg`（350 B）里存一个**随机种子**，身份由「该种子 + 机器证据 + 容器证据」共同决定。**「想换身份」本质上就是换这个种子**（我们之前「组件不落状态文件」的说法是错的）；
-> - **机制（三输入模型）**：`identity = f(种子[, $HOME/.config/.locale_cfg], 机器证据[DMI / CPU / …], 容器证据[/proc/mounts 的 overlay 行、网卡 MAC])` —— 这解释了两件事：**同一容器内身份恒定**（种子不变，实测 69 分钟 24 次采样无变化），而**重建容器会换**（overlay 行变，compose 层盖不住）；
-> - **想主动换身份**：删除 `accounts/machine_identity.json`（或启动时设 `QD_MACHINE_IDENTITY_RESET=1` 跑一次）；
-> - **不想启用**：`QD_MACHINE_IDENTITY_CACHE=off`（回到旧行为）；
-> - **想定期轮换**：`QD_MACHINE_IDENTITY_CACHE_TTL=<秒>`（默认 `0`＝不过期）。到期后会**清掉组件种子并取一个新身份**（**真的换**，不是重读一遍同一个值），重建后身份也随之改变；
-> - **三条会自动「换身份」的路径**：① 服务端不认当前身份时的**自愈**（`campaigns()` 判 `showCampaign=false`）；② **`QD_MACHINE_IDENTITY_RESET=1`**（或直接删缓存文件）；③ **TTL 到期**。**其余路径一律不碰种子** —— 否则「重建不换」会被自己削弱；
-> - 若服务端某天不再接受该身份，既有**自愈**会在活动列表被判「未认可」时刷新并**更新缓存**（日志有 WARN 提示）；
-> - ⚠️ 该文件代表**物理机器的身份**，**不要跨机器共享 `accounts/`**；顺带一提，组件不可用时（如 alpine 缺兼容层）现在也能**继续用真身份**，而不是退化成派生假身份。
->
-> **② 固定网卡 MAC（可选）** —— 如果你**不想**启用落盘缓存、或希望组件调用本身也稳定：
->
-> **① 固定网卡 MAC（推荐，代价最小）** —— 留在默认 bridge 网络、**保留 `ports:` 映射**：
-> ```yaml
-> services:
->   qoder-proxy:
->     mac_address: "02:42:ac:11:00:77"
->     ports: ["8790:8790"]
-> ```
->
-> 📌 **v1.2.13 起本方案已非必需**：只要 `accounts/` 是挂载卷，落盘缓存就连「重建/升级」都覆盖了（见上面 ①）。保留这一条是给「不挂载 `accounts/`」或「希望组件调用本身也稳定」的场景。
-> ⚠️ 上面那串 MAC **只是示例，请换成你自己生成的**，别照抄——macvlan 网络或同一宿主机跑多个实例时会撞 MAC：
-> ```bash
-> printf '02:42:%02x:%02x:%02x:%02x\n' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256))
-> ```
-> 若你的 Docker 拒绝 service 级 `mac_address`（官方文档提到 Engine ≥ v25 可能拒绝；实测 Docker 29.6.1 与 29.7.2 均接受），改用 `networks.<网络名>.mac_address`。
->
-> **② `network_mode: host`（备选）** —— 彻底共享宿主网络栈，适合宿主机端口冲突、或确实需要容器直接占用宿主端口时；代价是不能用 `ports:` 映射，且**切换前请确认目标端口在宿主机上空闲**，否则容器会启动失败。
->
-> **机制（两输入模型）**：`identity = f(每容器独有的量, 容器网卡 MAC)` —— bridge 下容器停止会重建 veth、MAC 随之改变，而身份同时依赖这两者；固定 MAC 即可让 `stop/start` 后身份逐字节不变。**两条路都只解决「重启」这一类**：**重建容器仍会换**（由「每容器独有的量」决定，compose 层无法覆盖）。
->
-> 以上已在 **amd64 与 arm64**、真实官方镜像 + 真实 compose 下验证（issue #18 的作者与我们的独立复现）。
+> 可用 tag：**`latest`**（main 最新）· **`sha-<短提交>`**（钉死某次构建）· **`1.5.2` / `1.5`**（v* tag 构建）。镜像为 **linux/amd64 + linux/arm64** 双架构。
 
 ### 6. 宿主机原生运行（调试推荐）
 
@@ -549,7 +520,7 @@ python _verify_models.py --base http://127.0.0.1:8790
 
 ## 七、版本与更新日志 (Changelog)
 
-完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+完整说明见 [Releases](https://github.com/qingdeng888/qoder2api-hub/releases)。
 
 ### v1.5.2
 
