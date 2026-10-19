@@ -51,33 +51,54 @@ def main():
     check("默认窗口 7200s（2 小时）", P.AUTO_DISABLE_403_SECS == 7200,
           P.AUTO_DISABLE_403_SECS)
 
-    # ---- 判定函数 ----
-    ok, why = P.should_auto_disable_403(PRICING_403)
-    check("付费墙 403（112）-> 模型级，不禁用账号",
-          not ok and why == "model_scoped", (ok, why))
+    # ---- 判定函数：只有免费模型 Qwen3.8-Flash 上的 403 才算数 ----
+    FREE = "Qwen3.8-Flash"
+    PAID = "Qwen3.8-Max"
+
+    check("is_free_model 认得官方名与上游 key",
+          P.is_free_model("Qwen3.8-Flash") and P.is_free_model("qfmodel")
+          and P.is_free_model("qwen3.8-flash"))
+    check("is_free_model 认得付费模型为 False",
+          P.is_free_model(PAID) is False and P.is_free_model("") is False)
+
+    ok, why = P.should_auto_disable_403(PRICING_403, model=PAID)
+    check("付费模型 403（112）-> 不冷却、不禁用",
+          not ok and why == "paid_model", (ok, why))
+    ok, why = P.should_auto_disable_403(PRICING_403, model=FREE)
+    check("免费模型 403（112）-> 自动禁用",
+          ok and "403" in why, (ok, why))
     ok, why = P.should_auto_disable_403(
-        '{"code":"403","message":"permission_error: not authorized"}')
-    check("权限拒绝 403 -> 自动禁用账号", ok, (ok, why))
+        '{"code":"403","message":"permission_error: not authorized"}',
+        model=FREE)
+    check("免费模型权限拒绝 403 -> 自动禁用", ok, (ok, why))
     ok, why = P.should_auto_disable_403(
-        '{"code":"403","message":"account_banned"}')
-    check("账号被封 403 -> 自动禁用账号", ok, (ok, why))
-    ok, why = P.should_auto_disable_403(QUEUE_403)
+        '{"code":"403","message":"account_banned"}', model=FREE)
+    check("免费模型账号被封 403 -> 自动禁用", ok, (ok, why))
+    ok, why = P.should_auto_disable_403(
+        '{"code":"403","message":"account_banned"}', model=PAID)
+    check("付费模型账号被封 403 -> 仍不冷却（口径只看模型）",
+          not ok and why == "paid_model", (ok, why))
+    ok, why = P.should_auto_disable_403(QUEUE_403, model=FREE)
     check("排队 10605 -> 不自动禁用", not ok and why == "queue", (ok, why))
     check("is_queue_403 识别 RESOURCE_LIMIT",
           P.is_queue_403('{"subCode":"RESOURCE_LIMIT"}') is True)
-    ok, why = P.should_auto_disable_403(POLICY_403)
+    ok, why = P.should_auto_disable_403(POLICY_403, model=FREE)
     check("内容审核 403 -> 不自动禁用", not ok and why == "content_policy",
           (ok, why))
     ok, why = P.should_auto_disable_403(
-        '{"code":"403","message":"invalid_parameter_error"}')
+        '{"code":"403","message":"invalid_parameter_error"}', model=FREE)
     check("参数错误 403 -> 不自动禁用", not ok and why == "client_fault",
           (ok, why))
     ok, why = P.should_auto_disable_403(
-        '{"code":"403","message":"TOKEN_EXPIRE"}')
+        '{"code":"403","message":"TOKEN_EXPIRE"}', model=FREE)
     check("凭证失效 -> 不自动禁用（走既有停用）",
           not ok and why == "session_dead", (ok, why))
-    ok, why = P.should_auto_disable_403("some unknown 403 body")
-    check("未知 403 -> 保守不禁用", not ok and why == "other", (ok, why))
+    ok, why = P.should_auto_disable_403("some unknown 403 body", model=FREE)
+    check("免费模型未知 403 -> 仍禁用（免费模型都不通则账号有问题）",
+          ok, (ok, why))
+    ok, why = P.should_auto_disable_403("some unknown 403 body", model=PAID)
+    check("付费模型未知 403 -> 不禁用", not ok and why == "paid_model",
+          (ok, why))
 
     # ---- Account 行为 ----
     tmp = tempfile.mkdtemp(prefix="qd-403-")
@@ -163,25 +184,30 @@ def main():
         acc.save(tmp2)
         pool.accounts.append(acc)
         P.POOL = pool
+        # 付费模型 403：既不冷却也不禁用（很多号本来就没有付费额度）
         exc = types.SimpleNamespace(status=403, detail=PRICING_403)
         P._handle_envelope_account_cooldown(acc, exc, model="Qwen3.8-Max",
                                             session_key=None)
-        check("信封 403（付费墙 112）-> 只停该模型 2h，账号仍可用",
+        check("信封 403（付费模型 112）-> 账号不冷却、不禁用",
               acc.enabled is True and acc.disabled_until == 0
-              and acc.model_cooldowns.get("Qwen3.8-Max", 0) > time.time() + 7000,
-              (acc.enabled, acc.model_cooldowns))
+              and acc.cooldown_until <= time.time()
+              and "Qwen3.8-Max" not in acc.model_cooldowns,
+              (acc.enabled, acc.cooldown_until - time.time(),
+               dict(acc.model_cooldowns)))
 
-        banned = A.Account({"uid": "env403-banned", "realm": "intl",
-                            "accessToken": "dt-b"})
-        banned.save(tmp2)
-        pool.accounts.append(banned)
-        exc_b = types.SimpleNamespace(
+        # 免费模型 403：账号确实不可用 -> 自动禁用
+        free_acc = A.Account({"uid": "env403-free", "realm": "intl",
+                              "accessToken": "dt-f"})
+        free_acc.save(tmp2)
+        pool.accounts.append(free_acc)
+        exc_f = types.SimpleNamespace(
             status=403, detail='{"code":"403","message":"account_banned"}')
-        P._handle_envelope_account_cooldown(banned, exc_b, model="Qwen3.8-Flash",
+        P._handle_envelope_account_cooldown(free_acc, exc_f,
+                                            model="Qwen3.8-Flash",
                                             session_key=None)
-        check("信封 403（账号被封）-> 账号自动禁用 2h",
-              banned.enabled is False and banned.auto_disabled_for() > 7000,
-              (banned.enabled, banned.auto_disabled_for()))
+        check("信封 403（免费模型）-> 账号自动禁用 2h",
+              free_acc.enabled is False and free_acc.auto_disabled_for() > 7000,
+              (free_acc.enabled, free_acc.auto_disabled_for()))
 
         queue_acc = A.Account({"uid": "env403-2", "realm": "intl",
                                "accessToken": "dt-y"})
@@ -191,6 +217,7 @@ def main():
         P._handle_envelope_account_cooldown(queue_acc, exc2,
                                             model="Qwen3.8-Flash",
                                             session_key=None)
+        # 排队仍然只做模型级冷却（免费模型也一样）
         check("信封 403（10605 排队）-> **不**禁用，只冷却",
               queue_acc.enabled is True and queue_acc.disabled_until == 0
               and queue_acc.model_cooldowns.get("Qwen3.8-Flash", 0) > time.time(),
@@ -201,7 +228,8 @@ def main():
         policy_acc.save(tmp2)
         pool.accounts.append(policy_acc)
         exc3 = types.SimpleNamespace(status=403, detail=POLICY_403)
-        P._handle_envelope_account_cooldown(policy_acc, exc3, model=None,
+        P._handle_envelope_account_cooldown(policy_acc, exc3,
+                                            model="Qwen3.8-Flash",
                                             session_key=None)
         check("信封 403（内容审核）-> 不禁用",
               policy_acc.enabled is True and policy_acc.disabled_until == 0,
@@ -268,16 +296,18 @@ def main():
             P.urllib, P.SESSIONS, P.time, P.POOL = real
             shutil.rmtree(tmp4, ignore_errors=True)
 
-    acc_model = run_http403(PRICING_403, "Qwen3.8-Max")
-    check("HTTP 403（112）-> 只冷却该模型，账号仍启用",
-          acc_model.enabled is True and acc_model.disabled_until == 0
-          and acc_model.model_cooldowns.get("Qwen3.8-Max", 0) > time.time() + 7000,
-          (acc_model.enabled, acc_model.model_cooldowns))
-    acc_ban = run_http403('{"code":"403","message":"account_banned"}',
-                          "Qwen3.8-Flash")
-    check("HTTP 403（账号被封）-> 自动禁用 2h",
-          acc_ban.enabled is False and acc_ban.auto_disabled_for() > 7000,
-          (acc_ban.enabled, acc_ban.auto_disabled_for()))
+    acc_paid = run_http403(PRICING_403, "Qwen3.8-Max")
+    check("HTTP 403（付费模型 112）-> 不冷却、不禁用",
+          acc_paid.enabled is True and acc_paid.disabled_until == 0
+          and acc_paid.cooldown_until <= time.time()
+          and not acc_paid.model_cooldowns,
+          (acc_paid.enabled, acc_paid.cooldown_until - time.time(),
+           dict(acc_paid.model_cooldowns)))
+    acc_free = run_http403('{"code":"403","message":"account_banned"}',
+                           "Qwen3.8-Flash")
+    check("HTTP 403（免费模型）-> 自动禁用 2h",
+          acc_free.enabled is False and acc_free.auto_disabled_for() > 7000,
+          (acc_free.enabled, acc_free.auto_disabled_for()))
 
     # ---- 模型级冷却要能在面板看到（否则「可用」却打不通）----
     tmp5 = tempfile.mkdtemp(prefix="qd-403-mcd-")

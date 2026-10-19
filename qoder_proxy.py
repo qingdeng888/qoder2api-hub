@@ -5124,18 +5124,6 @@ _CONTENT_POLICY_MARKERS = (
 #   ③ **请求内容问题**（内容审核、参数非法）：账号是好的，禁用毫无意义。
 AUTO_DISABLE_403_SECS = int(os.environ.get("QD_403_DISABLE_SECS") or 7200)
 
-# **模型级** 403：这个模型对该账号不可用（未开通/要付费），但同账号的其它
-# 模型仍然可用 —— 所以只能冷却这个模型，绝不能把整个账号禁 2 小时。
-# 反例（实测）：所有号打 Qwen3.8-Max 都返回 112+pricingUrl，而打
-# Qwen3.8-Flash 正常；按账号禁用会让整个池子瞬间全黑。
-_403_MODEL_SCOPED_MARKERS = (
-    "pricingurl",           # code 112：该模型需要付费套餐/credits
-    '"code":"112"',
-    '"code": "112"',
-    "model_not_available",
-    "model_disabled",
-)
-
 # 这些标记表示「这个号本身不被允许」而不是「这次请求有问题」
 _403_ACCOUNT_MARKERS = (
     "account_banned",
@@ -5158,11 +5146,35 @@ def is_queue_403(detail):
             or "isqueued" in low)
 
 
-def should_auto_disable_403(detail):
+# 只有「免费模型」上的 403 才说明账号本身不可用。付费模型 403 往往是
+# "这个号没有积分/没买套餐"——那是额度问题，不是账号坏了，禁用它等于把
+# 一堆只有免费额度的号全停掉。用户明确要求：只有 Qwen3.8-Flash（qfmodel）
+# 上的 403 才进入冷却。
+FREE_MODEL_IDS = ("qwen3.8-flash", "qfmodel")
+
+
+def is_free_model(model):
+    """该模型是否是免费模型（Qwen3.8-Flash / 上游 key qfmodel）。"""
+    name = str(model or "").strip().lower()
+    if not name:
+        return False
+    if name in FREE_MODEL_IDS:
+        return True
+    try:
+        key = str(qoder_catalog.resolve_upstream_key(
+            model, realm=CURRENT_REALM) or "").strip().lower()
+    except Exception:
+        key = ""
+    return key in FREE_MODEL_IDS
+
+
+def should_auto_disable_403(detail, model=None):
     """403 是否应触发「自动禁用 2 小时」。返回 (bool, reason)。
 
-    保守判定：只有明确指向账号/套餐不被允许的 403 才禁用；排队、内容审核、
-    参数错误一律不禁用（它们各自有更合适的处理）。
+    规则（用户口径）：**只有免费模型 Qwen3.8-Flash 上的 403 才冷却/禁用账号**。
+    - 付费模型 403（含 code 112 付费墙）-> 只记录，不冷却、不禁用：很多账号
+      积分就是 0，本来就用不了收费模型，禁用它们没有意义；
+    - 排队 10605 / 内容审核 / 参数错 / 凭证失效 -> 各自有更合适的处理，不禁用。
     """
     text = str(detail or "")
     low = text.lower()
@@ -5173,16 +5185,17 @@ def should_auto_disable_403(detail):
     if qoder_accounts.session_dead(text):
         # 凭证彻底失效：老逻辑是直接停用（不自动恢复），这里交给调用方处理
         return False, "session_dead"
-    # 模型级 403 先判：付费墙/单模型未开通，只冷却该模型，不禁用账号
-    if any(marker.lower() in low for marker in _403_MODEL_SCOPED_MARKERS):
-        return False, "model_scoped"
-    # 账号级标记先于 client_fault：permission_error 同时在两个名单里，
-    # 但 403 语境下它是「这个号没权限」，不是「这次请求参数错了」。
+    if not is_free_model(model):
+        # 付费模型：不接受它的 403 作为「账号不可用」的证据
+        return False, "paid_model"
+    # 账号级标记先于 client_fault：permission_error / authentication_error 同时
+    # 在两个名单里，但 403 语境下它们是「这个号没权限」，不是「这次请求参数错了」。
     if any(marker.lower() in low for marker in _403_ACCOUNT_MARKERS):
         return True, "账号被上游拒绝（403）"
     if any(marker in text for marker in _CLIENT_FAULT_MARKERS):
         return False, "client_fault"
-    return False, "other"
+    # 免费模型都 403 了：这个号确实不能用（被封/其它拒绝）
+    return True, "免费模型被拒绝（403）"
 
 
 def _is_transient_upstream(code, detail):
@@ -5335,6 +5348,16 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
             level="WARN", tag="chat")
     elif status_int in (401, 403):
         dead = qoder_accounts.session_dead(detail)
+        # 403 自动禁用（2h，到期自愈）：**只有免费模型上的 403 才算数**
+        disable, why = should_auto_disable_403(detail, model=model)
+        if status_int == 403 and why == "paid_model":
+            # 付费模型 403：账号只是没积分/没买套餐。不冷却、不禁用；
+            # 单次请求内换号继续试（不把这条 403 记成账号故障）。
+            log("account %s got 403 on paid model '%s' - not cooling "
+                "(no credits for paid models is normal), rotating for this "
+                "request only" % (account.uid[:8], model or "?"),
+                level="WARN", tag="chat")
+            return
         # 10605 排队冷却为模型级或账号级
         is_queue = is_queue_403(detail)
         cd = 300 if dead else (retry_secs if is_queue else 60)
@@ -5346,17 +5369,7 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
             "%.0fs (requested %ds, realm_ready=%d) and rotating"
             % (account.uid[:8], status_int, is_queue, float(actual or 0), cd,
                total), level="WARN", tag="chat")
-        # 403 自动禁用（2h，到期自愈）：排队/内容审核/参数问题不禁用
-        disable, why = should_auto_disable_403(detail)
-        if why == "model_scoped" and model and not dead:
-            # 该模型对这个号不可用（未开通/付费墙）：只把这个**模型**停 2 小时，
-            # 账号的其它模型继续可用。到期由 model_cooldowns 自然过期。
-            account.model_cooldowns[model] = time.time() + AUTO_DISABLE_403_SECS
-            log("model '%s' disabled on account %s for %ds (403 %s) - other "
-                "models keep working"
-                % (model, account.uid[:8], AUTO_DISABLE_403_SECS, detail[:60]),
-                level="WARN", tag="chat")
-        if disable and not dead:
+        if disable and not dead and hasattr(account, "auto_disable"):
             window = account.auto_disable(
                 AUTO_DISABLE_403_SECS,
                 "envelope 403: %s（%s）" % (why, detail[:120]))
@@ -5717,22 +5730,29 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                 last_429_detail = detail
                 continue
             if exc.code in (401, 403):
+                dead = qoder_accounts.session_dead(detail)
+                disable, why = should_auto_disable_403(detail, model=model)
+                if exc.code == 403 and why == "paid_model":
+                    # 付费模型 403：账号只是没积分/没买套餐，账号本身没坏。
+                    # 不冷却、不禁用，只把本次请求换到别的号继续试。
+                    if session_key and POOL:
+                        POOL.affinity.unbind(session_key)
+                    log("account %s got 403 on paid model '%s' - not cooling "
+                        "or disabling (no credits for paid models is normal); "
+                        "rotating for this request only"
+                        % (account.uid[:8], model or "?"),
+                        level="WARN", tag="chat")
+                    last_error = exc
+                    continue
                 log("account %s rejected (HTTP %s), rotating"
                     % (account.uid[:8], exc.code))
                 if session_key and POOL:
                     POOL.affinity.unbind(session_key)
-                dead = qoder_accounts.session_dead(detail)
                 account.note_error("HTTP %s %s" % (exc.code, detail[:80]),
                                    cooldown=300 if dead else 60,
                                    single_account=(total <= 1))
-                disable, why = should_auto_disable_403(detail)
-                if exc.code == 403 and why == "model_scoped" and model and not dead:
-                    account.model_cooldowns[model] = (
-                        time.time() + AUTO_DISABLE_403_SECS)
-                    log("model '%s' disabled on account %s for %ds (403 %s)"
-                        % (model, account.uid[:8], AUTO_DISABLE_403_SECS,
-                           detail[:60]), level="WARN", tag="chat")
-                if exc.code == 403 and disable and not dead:
+                if (exc.code == 403 and disable and not dead
+                        and hasattr(account, "auto_disable")):
                     window = account.auto_disable(
                         AUTO_DISABLE_403_SECS,
                         "HTTP 403: %s（%s）" % (why, detail[:120]))
