@@ -757,6 +757,38 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     </div>
   </section>
 
+  <!-- API 连通性测试（Playground 风格） -->
+  <section id="sectionApiConnectivity">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;flex-wrap:wrap;gap:10px">
+      <div>
+        <h2 style="margin:0">API 连通性测试 <em id="apiTestState"></em></h2>
+        <div style="font-size:12px;color:var(--dim);margin-top:4px;line-height:1.6">
+          向本网关发起一次真实的上游请求，验证整个链路（本地 Key → 网关路由 → 上游）是否正常响应。
+        </div>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:minmax(180px,260px) minmax(220px,1fr);gap:12px;align-items:start">
+      <div>
+        <div style="font-size:12px;color:var(--dim);margin-bottom:4px">测试模型</div>
+        <select id="apiTestModel" style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;color:var(--fg);font:inherit">
+          <option value="">（模型清单加载中…）</option>
+        </select>
+        <div id="apiTestModelHint" style="font-size:11px;color:var(--dim);margin-top:4px"></div>
+      </div>
+      <div>
+        <div style="font-size:12px;color:var(--dim);margin-bottom:4px">测试消息</div>
+        <textarea id="apiTestMessage" rows="2" placeholder="你是谁，出来干活了"
+                  style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;color:var(--fg);font:inherit;resize:vertical">你是谁，出来干活了</textarea>
+      </div>
+    </div>
+    <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <button class="primary" id="btnApiTest" onclick="runApiConnectivityTest(this)">🚀 发送测试请求</button>
+      <button class="sec mini" onclick="refreshApiTestModels(this)">刷新模型</button>
+      <span style="font-size:11px;color:var(--dim)">会消耗少量上游额度；同一 IP 每分钟最多 10 次</span>
+    </div>
+    <div id="apiTestResult" style="margin-top:14px"></div>
+  </section>
+
   <!-- 版本模型库与能力清单 -->
   <section>
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
@@ -772,7 +804,6 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
             <th style="text-align:center;width:160px">模型能力</th>
             <th style="text-align:center;width:130px">上下文窗口</th>
             <th style="text-align:left">思考档位</th>
-            <th style="text-align:center;width:130px">连通性</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -1789,7 +1820,7 @@ function renderAvailableModels(){
     countEm.textContent = '(共 ' + MODELS_DATA.length + ' 个 · 开放 ' + openN + ' 个)';
   }
   if(!MODELS_DATA.length){
-    tb.innerHTML = '<tr><td colspan="6" class="empty">暂无可用模型</td></tr>';
+    tb.innerHTML = '<tr><td colspan="5" class="empty">暂无可用模型</td></tr>';
     return;
   }
   tb.innerHTML = MODELS_DATA.map(m => {
@@ -1945,52 +1976,120 @@ function renderAvailableModels(){
       + '<td style="text-align:center">' + capHtml + '</td>'
       + '<td style="text-align:center">' + ctx + '</td>'
       + '<td style="text-align:left">' + effort + '</td>'
-      + '<td style="text-align:center">'
-      +   '<button class="sec mini" data-model="' + esc(m.id)
-      +     '" title="真实请求一次上游（max_tokens=16）" onclick="testModelConnectivity(this)">测试</button>'
-      +   '<div class="mt-result" style="font-size:10px;color:var(--dim);margin-top:3px;'
-      +     'line-height:1.4;max-width:150px;white-space:normal"></div>'
-      + '</td>'
       + '</tr>';
   }).join('');
+  renderApiTestModels();
 }
 
-async function testModelConnectivity(btn){
-  const model = btn.getAttribute('data-model') || '';
-  const cell = btn.closest('td');
-  const out = cell ? cell.querySelector('.mt-result') : null;
-  if(btn){ btn.disabled = true; btn.textContent = '测试中...'; }
-  if(out) out.innerHTML = '<span style="color:var(--dim)">请求中…</span>';
+function renderApiTestModels(){
+  const sel = document.getElementById('apiTestModel');
+  if(!sel) return;
+  const list = (MODELS_DATA || []).slice();
+  const prev = sel.value;
+  const hint = document.getElementById('apiTestModelHint');
+  const state = document.getElementById('apiTestState');
+  if(!list.length){
+    sel.innerHTML = '<option value="">（暂无模型）</option>';
+    if(state) state.textContent = '';
+    return;
+  }
+  sel.innerHTML = list.map(m => {
+    const suffix = m.enabled === false ? ' · 未开通' : (m.is_free ? ' · 免费' : '');
+    return '<option value="' + esc(m.id) + '">' + esc(m.id) + suffix + '</option>';
+  }).join('');
+  const preferred = list.find(m => m.enabled !== false) || list[0];
+  if(prev && list.some(m => m.id === prev)) sel.value = prev;
+  else if(preferred) sel.value = preferred.id;
+  if(state) state.textContent = '(' + list.length + ' 个模型)';
+  if(hint) hint.textContent = preferred && preferred.enabled === false
+    ? '当前没有已开通模型，测试会返回上游限制' : '';
+}
+
+async function refreshApiTestModels(btn){
+  if(btn){ btn.disabled = true; btn.textContent = '刷新中...'; }
   try{
-    const r = await postJSON('/diag/model',
-      {model: model, realm: window.VIEW_REALM || 'intl'});
-    if(r.ok){
-      const acc = r.account
-        ? (r.account.nickname || String(r.account.uid || '').slice(0, 8)) : '';
-      if(out){
-        out.innerHTML = '<div style="color:var(--accent2);font-weight:600">✓ '
-          + r.elapsed_ms + 'ms' + (acc ? ' · ' + esc(acc) : '') + '</div>'
-          + '<div style="color:var(--dim);word-break:break-word">'
-          + esc(r.reply || 'OK') + '</div>';
-      }
-      toast('模型 ' + model + ' 连通 (' + r.elapsed_ms + 'ms)', 'ok');
-    }else{
-      const msg = r.error || ('HTTP ' + r.status);
-      if(out){
-        out.innerHTML = '<div style="color:var(--bad);font-weight:600">✗ '
-          + (r.status || '失败') + '</div>'
-          + '<div style="color:var(--bad);word-break:break-word">'
-          + esc(msg) + '</div>';
-        if(r.detail) out.title = r.detail;
-      }
-      toast('模型 ' + model + ' 测试失败: ' + msg, 'bad');
-    }
+    await loadModels();
+    toast('模型清单已刷新', 'ok');
   }catch(e){
-    if(out) out.innerHTML = '<div style="color:var(--bad)">✗ '
-      + esc(e.message) + '</div>';
-    toast('模型测试失败: ' + e.message, 'bad');
+    toast('刷新模型失败: ' + e.message, 'bad');
   }finally{
-    if(btn){ btn.disabled = false; btn.textContent = '测试'; }
+    if(btn){ btn.disabled = false; btn.textContent = '刷新模型'; }
+  }
+}
+
+function renderApiTestResult(r){
+  const ok = !!r.ok;
+  const badge = ok
+    ? '<span class="badge ok">✓ ' + (r.status || 200) + '</span>'
+    : '<span class="badge bad">✗ ' + (r.status || '失败') + '</span>';
+  let html = '<div class="card" style="border-color:'
+    + (ok ? 'rgba(38,187,130,.45)' : 'rgba(220,80,80,.45)') + '">';
+  html += '<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">'
+    + badge + '<b>' + esc(r.model || '') + '</b>'
+    + '<span style="font-size:12px;color:var(--dim)">'
+    + esc(String(r.elapsed_ms || 0) + 'ms')
+    + (r.realm ? ' · ' + esc(r.realm) + ' 出口' : '')
+    + '</span></div>';
+  if(r.message){
+    html += '<div style="font-size:12px;color:var(--dim);margin-top:6px">请求：'
+      + esc(r.message) + '</div>';
+  }
+  if(ok){
+    html += '<pre style="white-space:pre-wrap;word-break:break-word;background:var(--panel2);'
+      + 'border:1px solid var(--line);border-radius:8px;padding:10px;margin-top:10px;'
+      + 'font-size:13px;line-height:1.55">' + esc(r.reply || '(空回复)') + '</pre>';
+  }else{
+    html += '<div style="color:var(--bad);font-size:13px;margin-top:8px;line-height:1.55">'
+      + esc(r.error || '未知错误') + '</div>';
+  }
+  const raw = r.response !== undefined ? r.response : r.detail;
+  let rawText = '';
+  try{
+    rawText = typeof raw === 'string' ? raw : JSON.stringify(raw, null, 2);
+  }catch(e){
+    rawText = String(raw);
+  }
+  if(rawText){
+    html += '<details style="margin-top:10px"><summary style="cursor:pointer;font-size:12px;'
+      + 'color:var(--dim)">原始响应 / 上游详情</summary>'
+      + '<pre style="white-space:pre-wrap;word-break:break-word;max-height:320px;overflow:auto;'
+      + 'background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px;'
+      + 'font-size:11px;line-height:1.5">' + esc(rawText.slice(0, 8000)) + '</pre></details>';
+  }
+  html += '</div>';
+  return html;
+}
+
+async function runApiConnectivityTest(btn){
+  const modelEl = document.getElementById('apiTestModel');
+  const msgEl = document.getElementById('apiTestMessage');
+  const box = document.getElementById('apiTestResult');
+  const model = modelEl ? modelEl.value : '';
+  const message = msgEl ? String(msgEl.value || '').trim() : '';
+  if(!model){ toast('请选择测试模型', 'warn'); return; }
+  if(!message){ toast('请输入测试消息', 'warn'); return; }
+  if(btn){ btn.disabled = true; btn.textContent = '测试中...'; }
+  if(box){
+    box.innerHTML = '<div class="empty" style="padding:16px">'
+      + '正在向本网关发送真实请求…</div>';
+  }
+  try{
+    const r = await postJSON('/diag/connectivity',
+      {model: model, message: message, max_tokens: 256});
+    if(box) box.innerHTML = renderApiTestResult(r);
+    toast(r.ok ? ('API 连通性正常 (' + r.elapsed_ms + 'ms)')
+               : ('测试失败: ' + (r.error || ('HTTP ' + r.status))),
+          r.ok ? 'ok' : 'bad');
+  }catch(e){
+    if(box){
+      box.innerHTML = '<div class="card" style="border-color:var(--bad)">'
+        + '<b style="color:var(--bad)">请求失败</b>'
+        + '<div style="font-size:12px;color:var(--dim);margin-top:6px">'
+        + esc(e.message) + '</div></div>';
+    }
+    toast('测试请求失败: ' + e.message, 'bad');
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '🚀 发送测试请求'; }
   }
 }
 
