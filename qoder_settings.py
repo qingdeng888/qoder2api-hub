@@ -267,6 +267,33 @@ def set_auth_disabled(accounts_dir, disabled):
         save(accounts_dir, data)
 
 
+# --------------------------------------------------- probe (diagnostic) model
+# 「用哪个模型做连通性/账号体检」是运维决策：免费模型会随官方调整而变，
+# 写死在代码里迟早过期。这里持久化一个可选项，空 = 用内置默认
+# （qoder_proxy.DIAG_DEFAULT_MODEL，Qwen3.8-Flash）。
+PROBE_MODEL_KEY = "probe_model"
+PROBE_MODEL_MAX = 80
+
+
+def probe_model(accounts_dir):
+    """用户配置的检测模型；未配置返回空串（调用方回落到内置默认）。"""
+    value = str(load(accounts_dir).get(PROBE_MODEL_KEY) or "").strip()
+    return value[:PROBE_MODEL_MAX]
+
+
+def set_probe_model(accounts_dir, value):
+    """落盘检测模型；空白 = 清除（回到内置默认）。返回规范化后的值。"""
+    text = str(value or "").strip()[:PROBE_MODEL_MAX]
+    with _lock:
+        data = load(accounts_dir)
+        if text:
+            data[PROBE_MODEL_KEY] = text
+        else:
+            data.pop(PROBE_MODEL_KEY, None)
+        save(accounts_dir, data)
+    return text
+
+
 # ------------------------------------------------------------- model gates
 # P1-4：模型闸门配置层。全局封禁（banned_models）与每 Key 白名单（key 条目的
 # models 字段）共用同一套 pattern 清洗与匹配：fnmatch 通配、大小写不敏感；

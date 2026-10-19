@@ -1094,6 +1094,34 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <div id="keyList"></div>
     </section>
 
+    <section id="sectionProbeModel">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;flex-wrap:wrap;gap:10px">
+        <div>
+          <h2 style="margin:0">检测模型 <em id="setProbeState"></em></h2>
+          <div style="font-size:12px;color:var(--dim);margin-top:4px;line-height:1.6">
+            连通性测试、账号「测试」以及 <b>403 冷却判定</b>都使用这个模型：
+            只有<b>这个模型</b>返回 403 才会冷却/自动禁用账号，其它模型的 403 一律不动账号
+            （很多号没有付费额度，收费模型 403 是常态）。免费模型会随官方调整，
+            所以留空 = 用内置默认（<span class="mono" id="probeDefaultHint">Qwen3.8-Flash</span>）。
+          </div>
+        </div>
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+        <div style="flex:1;min-width:220px">
+          <div style="font-size:12px;color:var(--dim);margin-bottom:4px">检测模型（官方模型名，留空 = 内置默认）</div>
+          <input id="setProbeModel" list="probeModelOptions" type="text"
+                 placeholder="例如 Qwen3.8-Flash"
+                 style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--fg);font:inherit">
+          <datalist id="probeModelOptions"></datalist>
+          <div id="setProbeEffective" style="font-size:11px;color:var(--dim);margin-top:4px"></div>
+        </div>
+        <button onclick="saveProbeModel(this)">保存检测模型</button>
+        <button class="sec mini" onclick="clearProbeModel(this)">恢复内置默认</button>
+        <button class="sec mini" onclick="testProbeModel(this)">用该模型测试一次</button>
+      </div>
+      <div id="probeTestResult" style="margin-top:10px"></div>
+    </section>
+
     <section id="sectionLimits">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:10px">
         <div>
@@ -3899,6 +3927,7 @@ async function loadSettings(showToast){
     renderAccountProxyBindings(data.account_proxy_bindings || [],
                                data.proxy_pool || null);
     if(data.diag_default_model) window.DIAG_DEFAULT_MODEL = data.diag_default_model;
+    renderProbeModelSettings(data);
     if(showToast) toast('设置已刷新', 'ok');
   } catch(e) {
     if(showToast) toast('读取设置失败: ' + e.message, 'bad');
@@ -4312,6 +4341,87 @@ async function saveLimits(btn){
     toast('保存限额失败: ' + e.message, 'bad');
   }finally{
     if(btn){ btn.disabled = false; btn.textContent = '保存限额'; }
+  }
+}
+
+/* ---- 检测模型（连通性测试 / 账号测试 / 403 冷却判定都用它）----
+   免费模型会随官方调整，写死在代码里迟早过期，所以允许面板自定义。
+   留空 = 内置默认；生效值由后端 probe_model_effective 回传。 */
+function renderProbeModelSettings(data){
+  data = data || {};
+  const input = document.getElementById('setProbeModel');
+  if(input && document.activeElement !== input){
+    input.value = data.probe_model || '';
+  }
+  const def = document.getElementById('probeDefaultHint');
+  if(def) def.textContent = data.diag_default_model || 'Qwen3.8-Flash';
+  const eff = document.getElementById('setProbeEffective');
+  const effective = data.probe_model_effective || data.diag_default_model || '';
+  window.DIAG_DEFAULT_MODEL = effective || window.DIAG_DEFAULT_MODEL;
+  if(eff){
+    eff.innerHTML = '当前生效：<b class="mono">' + esc(effective) + '</b>'
+      + (data.probe_model ? '（自定义）' : '（内置默认）');
+  }
+  const state = document.getElementById('setProbeState');
+  if(state){
+    state.textContent = data.probe_model ? '(自定义)' : '(内置默认)';
+    state.style.color = data.probe_model ? 'var(--accent2)' : 'var(--dim)';
+  }
+  // 下拉候选：用已加载的模型清单，省得用户记名字
+  const list = document.getElementById('probeModelOptions');
+  if(list){
+    list.innerHTML = (MODELS_DATA || []).map(m =>
+      '<option value="' + esc(m.id) + '"></option>').join('');
+  }
+  // 诊断页下拉的默认值也跟着切
+  const sel = document.getElementById('apiTestModel');
+  if(sel && effective && Array.from(sel.options).some(o => o.value === effective)){
+    sel.value = effective;
+  }
+  if(typeof renderApiTestModels === 'function') renderApiTestModels();
+}
+
+async function saveProbeModel(btn){
+  const el = document.getElementById('setProbeModel');
+  const value = el ? String(el.value || '').trim() : '';
+  if(btn){ btn.disabled = true; btn.textContent = '保存中...'; }
+  try{
+    const r = await postJSON('/settings/save', {probe_model: value});
+    renderProbeModelSettings(r);
+    toast(value ? ('检测模型已设为 ' + value) : '已恢复内置默认检测模型', 'ok');
+  }catch(e){
+    toast('保存检测模型失败: ' + e.message, 'bad');
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '保存检测模型'; }
+  }
+}
+
+async function clearProbeModel(btn){
+  const el = document.getElementById('setProbeModel');
+  if(el) el.value = '';
+  await saveProbeModel(btn);
+}
+
+async function testProbeModel(btn){
+  const box = document.getElementById('probeTestResult');
+  const effective = window.DIAG_DEFAULT_MODEL || 'Qwen3.8-Flash';
+  if(btn){ btn.disabled = true; btn.textContent = '测试中...'; }
+  if(box) box.innerHTML = '<div class="empty" style="padding:12px">正在用 '
+    + esc(effective) + ' 发一次真实请求…</div>';
+  try{
+    const r = await postJSON('/diag/connectivity',
+      {model: effective, message: '你是谁，出来干活了'});
+    if(box) box.innerHTML = renderApiTestResult(r);
+    toast(r.ok ? ('检测模型可用 (' + r.elapsed_ms + 'ms)')
+               : ('检测模型不可用: ' + (r.error || ('HTTP ' + r.status))),
+          r.ok ? 'ok' : 'bad');
+  }catch(e){
+    if(box) box.innerHTML = '<div class="card"><b style="color:var(--bad)">测试失败</b>'
+      + '<div style="font-size:12px;color:var(--dim);margin-top:6px">'
+      + esc(e.message) + '</div></div>';
+    toast('测试检测模型失败: ' + e.message, 'bad');
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '用该模型测试一次'; }
   }
 }
 

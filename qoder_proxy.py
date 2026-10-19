@@ -2131,8 +2131,11 @@ def runtime_settings_view():
         "proxy_pool": qoder_proxypool.status_view(),
         # Qoder 账号（≈参考项目的上游 Key）的出口绑定
         "account_proxy_bindings": account_proxy_bindings_view(),
-        # 诊断默认模型（面板「API 连通性测试」默认选中免费模型）
+        # 诊断 / 冷却判定使用的「探测模型」：面板可自定义，空 = 内置默认
         "diag_default_model": DIAG_DEFAULT_MODEL,
+        "probe_model": qoder_settings.probe_model(ACCOUNTS_DIR),
+        "probe_model_effective": probe_model(),
+        "probe_model_env": "QD_DIAG_MODEL",
         # 403 自动禁用策略（面板展示用；窗口可用 QD_403_DISABLE_SECS 调整）
         "auto_disable_403": {
             "seconds": AUTO_DISABLE_403_SECS,
@@ -5146,15 +5149,55 @@ def is_queue_403(detail):
             or "isqueued" in low)
 
 
-# 只有「免费模型」上的 403 才说明账号本身不可用。付费模型 403 往往是
-# "这个号没有积分/没买套餐"——那是额度问题，不是账号坏了，禁用它等于把
-# 一堆只有免费额度的号全停掉。用户明确要求：只有 Qwen3.8-Flash（qfmodel）
-# 上的 403 才进入冷却。
+# 检测/冷却口径所用的模型（"探测模型"）：只有这个模型上的 403 才说明账号
+# 本身不可用。付费模型 403 往往是"这个号没有积分/没买套餐"——那是额度问题，
+# 不是账号坏了，禁用它等于把一堆只有免费额度的号全停掉。
+#
+# 免费模型会随官方调整而变，所以这个模型**可在面板设置里自定义**
+# （settings.json 的 probe_model）；未配置时用 DIAG_DEFAULT_MODEL。
 FREE_MODEL_IDS = ("qwen3.8-flash", "qfmodel")
 
 
+def probe_model():
+    """当前用于检测/冷却判定的模型（面板可自定义，空 = 内置默认）。"""
+    try:
+        configured = qoder_settings.probe_model(ACCOUNTS_DIR)
+    except Exception:
+        configured = ""
+    return configured or DIAG_DEFAULT_MODEL
+
+
+def _same_model(a, b):
+    """两个模型名是否指同一个（官方名 / 上游 key / 别名都能对上）。"""
+    left = str(a or "").strip().lower()
+    right = str(b or "").strip().lower()
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    for realm in ("intl", "cn", None):
+        try:
+            if str(qoder_catalog.resolve_upstream_key(
+                    left, realm=realm) or "").strip().lower() == \
+                    str(qoder_catalog.resolve_upstream_key(
+                        right, realm=realm) or "").strip().lower():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def is_probe_model(model):
+    """该模型是否是「探测模型」（默认 Qwen3.8-Flash，可在面板改）。"""
+    return _same_model(model, probe_model())
+
+
 def is_free_model(model):
-    """该模型是否是免费模型（Qwen3.8-Flash / 上游 key qfmodel）。"""
+    """该模型是否是内置免费模型（Qwen3.8-Flash / 上游 key qfmodel）。
+
+    保留这个判断用于"哪些模型肯定不要钱"的展示；**冷却口径请用
+    is_probe_model()**——它跟随用户在面板里配置的检测模型。
+    """
     name = str(model or "").strip().lower()
     if not name:
         return False
@@ -5185,8 +5228,8 @@ def should_auto_disable_403(detail, model=None):
     if qoder_accounts.session_dead(text):
         # 凭证彻底失效：老逻辑是直接停用（不自动恢复），这里交给调用方处理
         return False, "session_dead"
-    if not is_free_model(model):
-        # 付费模型：不接受它的 403 作为「账号不可用」的证据
+    if not is_probe_model(model):
+        # 非探测模型：不接受它的 403 作为「账号不可用」的证据
         return False, "paid_model"
     # 账号级标记先于 client_fault：permission_error / authentication_error 同时
     # 在两个名单里，但 403 语境下它们是「这个号没权限」，不是「这次请求参数错了」。
@@ -6303,6 +6346,13 @@ def resolve_diag_model(model=None, realm=None):
     explicit = str(model or "").strip()
     if explicit:
         return explicit
+    # 用户配置的检测模型优先（免费模型会变，写死会过期）
+    try:
+        configured = qoder_settings.probe_model(ACCOUNTS_DIR)
+    except Exception:
+        configured = ""
+    if configured:
+        return configured
     fallback = DIAG_DEFAULT_MODEL
     try:
         entries = fetch_models(realm=realm or CURRENT_REALM)
@@ -8239,6 +8289,14 @@ class Handler(BaseHTTPRequestHandler):
             qoder_settings.set_auth_disabled(ACCOUNTS_DIR,
                                              payload.get("auth_disabled"))
             reply["auth_disabled"] = bool(payload.get("auth_disabled"))
+        if "probe_model" in payload:
+            # 检测/冷却判定使用的模型（免费模型会变，允许面板自定义）
+            reply["probe_model"] = qoder_settings.set_probe_model(
+                ACCOUNTS_DIR, payload.get("probe_model"))
+            reply["probe_model_effective"] = probe_model()
+            log("probe model set to %r (was %r)"
+                % (reply["probe_model"] or "(built-in default)",
+                   DIAG_DEFAULT_MODEL), tag="diag")
         new_key = payload.get("api_key")
         if new_key is not None:
             new_key = str(new_key).strip()
