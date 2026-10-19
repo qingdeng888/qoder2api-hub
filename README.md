@@ -61,6 +61,7 @@
 > python _diag_gateway.py --chat   # 端口 → /health → /v1/models → 真实流式，逐项报出断在哪
 > python _diag_campaign.py         # 签到/活动链路体检（含本机虚拟化状态，中文输出）
 > ```
+> 也可以在面板「网关 → 当前版本模型库」每一行点「测试」：走与正常推理相同的账号/代理/签名链路，实际发一次 `max_tokens=16` 的最小请求，直接显示耗时、实际账号、回复或上游错误（例如 10605 排队、112 付费墙）。
 > - **生命周期就是那个窗口**（刻意的设计）：窗口开着网关就活着，**关掉窗口（或 Ctrl+C）网关即停**，不会有后台残留进程；下次要用重新运行启动脚本即可。
 > - 判别口诀：日志时间戳停在某一刻、此后再无 `POST /v1/chat/completions` = 网关已停；重新运行启动脚本即可恢复。
 
@@ -449,6 +450,7 @@ custom freeform 工具（`apply_patch`）自动降级为 function 工具出站�
 | POST | /v1/chat/completions | 标准 Chat Completions 接口 |
 | POST | /v1/responses | Responses API 协议接口 |
 | GET | /v1/models | 模型列表（动态拉取 + 静态兜底，含能力与规格宣告） |
+| POST | /diag/model | 模型连通性测试：真实发一次最小请求（max_tokens≤64），返回状态/耗时/实际账号/回复或上游错误（需面板会话，20 次/分钟/IP） |
 | GET | /credits/summary | **API-key 级**鉴权的只读积分汇总（**只回本地登记值、不触发任何上游查询**）——给下游集成轮询用，见下方说明 |
 | GET | /tasks | 签到状态、连续天数、福利包资格与额度快照 |
 | POST | /tasks/run | 触发批量每日签到与领奖 |

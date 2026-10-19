@@ -5160,7 +5160,8 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
                 pass
 
 
-def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
+def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
+                  allow_queue_wait=True):
     """构造 COSY 签名请求并打开上游 SSE。返回 (resp, account, encoded)。
 
     usage_ctx：可选**出参** dict。传入时回填本次请求的推理档位审计信息
@@ -5284,7 +5285,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                 # 交给客户端）。仅在预算与单轮上限内等待；超出即按原错误走
                 # 既有分类（fail-open 语义不变）。
                 qwait = _queue_wait_seconds(detail)
-                if qwait > 0 and queue_tries < QUEUE_MAX_ROUNDS \
+                if allow_queue_wait and qwait > 0 \
+                        and queue_tries < QUEUE_MAX_ROUNDS \
                         and qwait <= QUEUE_WAIT_MAX_SECS \
                         and (time.time() - queue_start) + qwait \
                         <= QUEUE_WAIT_BUDGET_SECS:
@@ -5801,6 +5803,138 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
 # ---------------------------------------------------------------------------
 # Responses API (/v1/responses) <-> Chat Completions translation
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 模型连通性测试（面板「模型库」每行的“测试”按钮）
+# ---------------------------------------------------------------------------
+_DIAG_MODEL_LOCK = threading.Lock()
+_DIAG_MODEL_ATTEMPTS = {}
+
+
+def allow_model_diag(client_ip, limit=20, window=60):
+    """诊断请求限流：每客户端每分钟最多 limit 次，避免被当成免费压测通道。"""
+    now = time.time()
+    key = str(client_ip or "?")
+    with _DIAG_MODEL_LOCK:
+        recent = [item for item in _DIAG_MODEL_ATTEMPTS.get(key, [])
+                  if now - item < window]
+        if len(recent) >= limit:
+            _DIAG_MODEL_ATTEMPTS[key] = recent
+            return False
+        recent.append(now)
+        _DIAG_MODEL_ATTEMPTS[key] = recent
+        if len(_DIAG_MODEL_ATTEMPTS) > 2048:
+            for candidate in list(_DIAG_MODEL_ATTEMPTS):
+                if not _DIAG_MODEL_ATTEMPTS[candidate]:
+                    _DIAG_MODEL_ATTEMPTS.pop(candidate, None)
+    return True
+
+
+def diag_model_error_text(code, detail):
+    """把诊断请求的上游错误翻译成面板可读的一句话。"""
+    detail = str(detail or "")
+    low = detail.lower()
+    if "10605" in detail or "isqueued" in low:
+        return ("上游排队/资源受限（10605 / RESOURCE_LIMIT）：该模型当前不可用，"
+                "请稍后重试或升级/充值套餐")
+    if "pricingurl" in low or '"112"' in detail:
+        return ("该模型需要付费套餐或 credits（上游 code 112），"
+                "请先在 Qoder 升级/充值后再试")
+    message, _kind = friendly_upstream_error(code, detail)
+    return message
+
+
+def probe_model_connectivity(model, realm=None, prompt=None, max_tokens=16):
+    """跑一次最小真实请求，返回结构化诊断结果（不向外抛异常）。
+
+    这是“端到端连通性”：走与正常推理相同的 open_upstream（签名、账号、
+    代理绑定），只把输出限制在很小的一段；不等待上游排队，避免面板请求
+    挂住几分钟。
+    """
+    model = str(model or "").strip()
+    started = time.time()
+    if not model:
+        return {"ok": False, "status": 400, "model": "",
+                "error": "model is required", "elapsed_ms": 0}
+    if realm not in ("intl", "cn"):
+        realm = detect_model_realm(model) or CURRENT_REALM
+    try:
+        limit = max(1, min(64, int(max_tokens or 16)))
+    except (TypeError, ValueError):
+        limit = 16
+    text = str(prompt or "ping")[:500]
+    test_payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": text}],
+        "stream": False,
+        "max_tokens": limit,
+    }
+    account = None
+    try:
+        resp, account, _encoded = open_upstream(
+            test_payload, target_realm=realm, allow_queue_wait=False)
+        with resp:
+            chat_obj = aggregate_stream(resp, model, None)
+        choices = chat_obj.get("choices") or []
+        message = (choices[0].get("message") or {}) if choices else {}
+        reply = (message.get("content") or message.get("reasoning_content")
+                 or "OK")
+        reply = str(reply).strip()
+        if len(reply) > 240:
+            reply = reply[:237] + "..."
+        elapsed_ms = int((time.time() - started) * 1000)
+        upstream_key = ""
+        try:
+            upstream_key = qoder_catalog.resolve_upstream_key(
+                model, realm=realm) or ""
+        except Exception:
+            pass
+        return {
+            "ok": True,
+            "status": 200,
+            "model": model,
+            "realm": realm,
+            "upstream_key": upstream_key,
+            "elapsed_ms": elapsed_ms,
+            "account": {
+                "uid": getattr(account, "uid", ""),
+                "nickname": getattr(account, "nickname", ""),
+                "realm": getattr(account, "realm", realm),
+            } if account else None,
+            "reply": reply,
+            "usage": chat_obj.get("usage"),
+        }
+    except RateLimited as exc:
+        detail = str(getattr(exc, "detail", "") or exc)
+        return {"ok": False, "status": 429, "model": model, "realm": realm,
+                "error": "所有可用账号都在冷却/限流中：%s" % detail[:300],
+                "detail": detail[:800],
+                "elapsed_ms": int((time.time() - started) * 1000)}
+    except urllib.error.HTTPError as exc:
+        detail = getattr(exc, "qoder_detail", "") or ""
+        if not detail:
+            try:
+                detail = exc.read(800).decode("utf-8", "replace")
+            except Exception:
+                detail = ""
+        code = int(getattr(exc, "code", 502) or 502)
+        return {"ok": False, "status": code, "model": model, "realm": realm,
+                "error": diag_model_error_text(code, detail),
+                "detail": detail[:800],
+                "elapsed_ms": int((time.time() - started) * 1000)}
+    except UpstreamStatus as exc:
+        code = _to_int_status(getattr(exc, "status", 502))
+        detail = str(getattr(exc, "detail", "") or exc)
+        return {"ok": False, "status": code, "model": model, "realm": realm,
+                "error": diag_model_error_text(code, detail),
+                "detail": detail[:800],
+                "elapsed_ms": int((time.time() - started) * 1000)}
+    except Exception as exc:
+        return {"ok": False, "status": 502, "model": model, "realm": realm,
+                "error": "诊断请求失败：%s" % str(exc)[:300],
+                "detail": str(exc)[:800],
+                "elapsed_ms": int((time.time() - started) * 1000)}
+
+
 def local_ip_addresses():
     """Every non-loopback IPv4 address this machine answers on."""
     found = []
@@ -7439,6 +7573,38 @@ class Handler(BaseHTTPRequestHandler):
             self._error(400, "invalid JSON body", "invalid_request_error")
             return None
 
+    def _handle_model_diag(self):
+        """面板「模型库」每行的连通性测试：跑一次最小真实请求。"""
+        payload = self._payload_or_error()
+        if payload is None:
+            return
+        client_ip = self.client_address[0] \
+            if hasattr(self, "client_address") and self.client_address \
+            else "127.0.0.1"
+        if not allow_model_diag(client_ip):
+            return self._error(429, "too many model tests; retry in a minute",
+                               "rate_limit_error")
+        model = str(payload.get("model") or "").strip()
+        if not model:
+            return self._error(400, "model is required",
+                               "invalid_request_error")
+        realm = str(payload.get("realm") or "").strip().lower()
+        if realm not in ("intl", "cn"):
+            realm = None
+        try:
+            max_tokens = int(payload.get("max_tokens") or 16)
+        except (TypeError, ValueError):
+            max_tokens = 16
+        result = probe_model_connectivity(
+            model, realm=realm, prompt=payload.get("prompt"),
+            max_tokens=max_tokens)
+        log("model diag: model=%s realm=%s ok=%s status=%s wall=%dms"
+            % (result.get("model") or model,
+               result.get("realm") or realm or CURRENT_REALM,
+               result.get("ok"), result.get("status"),
+               int(result.get("elapsed_ms") or 0)), tag="diag")
+        return self._json(200, result)
+
     def _handle_proxy_pool(self, path):
         """出站代理池面板端点。
 
@@ -8459,6 +8625,8 @@ class Handler(BaseHTTPRequestHandler):
         if self._is_panel_route(path) and not self._panel_ok():
             return self._error(401, "panel password required",
                                "invalid_request_error")
+        if path == "/diag/model":
+            return self._handle_model_diag()
         if path in ("/agents/apply", "/agents/restore"):
             # 写**网关所在机器**的客户端配置文件：面板会话不够，还必须来自
             # loopback（远程/容器调用按设计拒绝——那是配置器 CLI 的活）。

@@ -772,6 +772,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
             <th style="text-align:center;width:160px">模型能力</th>
             <th style="text-align:center;width:130px">上下文窗口</th>
             <th style="text-align:left">思考档位</th>
+            <th style="text-align:center;width:130px">连通性</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -1788,7 +1789,7 @@ function renderAvailableModels(){
     countEm.textContent = '(共 ' + MODELS_DATA.length + ' 个 · 开放 ' + openN + ' 个)';
   }
   if(!MODELS_DATA.length){
-    tb.innerHTML = '<tr><td colspan="5" class="empty">暂无可用模型</td></tr>';
+    tb.innerHTML = '<tr><td colspan="6" class="empty">暂无可用模型</td></tr>';
     return;
   }
   tb.innerHTML = MODELS_DATA.map(m => {
@@ -1944,8 +1945,53 @@ function renderAvailableModels(){
       + '<td style="text-align:center">' + capHtml + '</td>'
       + '<td style="text-align:center">' + ctx + '</td>'
       + '<td style="text-align:left">' + effort + '</td>'
+      + '<td style="text-align:center">'
+      +   '<button class="sec mini" data-model="' + esc(m.id)
+      +     '" title="真实请求一次上游（max_tokens=16）" onclick="testModelConnectivity(this)">测试</button>'
+      +   '<div class="mt-result" style="font-size:10px;color:var(--dim);margin-top:3px;'
+      +     'line-height:1.4;max-width:150px;white-space:normal"></div>'
+      + '</td>'
       + '</tr>';
   }).join('');
+}
+
+async function testModelConnectivity(btn){
+  const model = btn.getAttribute('data-model') || '';
+  const cell = btn.closest('td');
+  const out = cell ? cell.querySelector('.mt-result') : null;
+  if(btn){ btn.disabled = true; btn.textContent = '测试中...'; }
+  if(out) out.innerHTML = '<span style="color:var(--dim)">请求中…</span>';
+  try{
+    const r = await postJSON('/diag/model',
+      {model: model, realm: window.VIEW_REALM || 'intl'});
+    if(r.ok){
+      const acc = r.account
+        ? (r.account.nickname || String(r.account.uid || '').slice(0, 8)) : '';
+      if(out){
+        out.innerHTML = '<div style="color:var(--accent2);font-weight:600">✓ '
+          + r.elapsed_ms + 'ms' + (acc ? ' · ' + esc(acc) : '') + '</div>'
+          + '<div style="color:var(--dim);word-break:break-word">'
+          + esc(r.reply || 'OK') + '</div>';
+      }
+      toast('模型 ' + model + ' 连通 (' + r.elapsed_ms + 'ms)', 'ok');
+    }else{
+      const msg = r.error || ('HTTP ' + r.status);
+      if(out){
+        out.innerHTML = '<div style="color:var(--bad);font-weight:600">✗ '
+          + (r.status || '失败') + '</div>'
+          + '<div style="color:var(--bad);word-break:break-word">'
+          + esc(msg) + '</div>';
+        if(r.detail) out.title = r.detail;
+      }
+      toast('模型 ' + model + ' 测试失败: ' + msg, 'bad');
+    }
+  }catch(e){
+    if(out) out.innerHTML = '<div style="color:var(--bad)">✗ '
+      + esc(e.message) + '</div>';
+    toast('模型测试失败: ' + e.message, 'bad');
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '测试'; }
+  }
 }
 
 let CURRENT_GROWTH_UID = 'all';
