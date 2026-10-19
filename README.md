@@ -126,11 +126,11 @@ docker pull ghcr.io/qingdeng888/qoder2api-hub:latest
 
 > **首次使用 fork 的 Actions**：到 `Settings → Actions → General` 允许 workflows（或在 Actions 页点击 “I understand my workflows, go ahead and enable them”）；推送到 `main` 后会自动触发，也可以在 [Actions 页面](https://github.com/qingdeng888/qoder2api-hub/actions/workflows/docker-publish.yml) 手动 `Run workflow`。
 >
-> **GHCR 包默认是私有的**：如果 `docker compose pull` 提示 denied，先登录（PAT 需要 `read:packages`）：
+> **GHCR 包访问**：本 fork 的镜像包当前为 **public**，`docker compose pull` 可直接拉取；如果以后改成 private，先登录（PAT 需要 `read:packages`）：
 > ```bash
 > echo "$CR_PAT" | docker login ghcr.io -u qingdeng888 --password-stdin
 > ```
-> 或者到 [包设置](https://github.com/users/qingdeng888/packages/container/qoder2api-hub/settings) 把 visibility 改为 Public。
+> 包可见性可在 [包设置](https://github.com/users/qingdeng888/packages/container/qoder2api-hub/settings) 调整。
 
 **方式二：本地源码构建**。把 `docker-compose.yml` 里的 `image:` 注释掉、取消 `build:` 的注释：
 
