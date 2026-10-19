@@ -1993,16 +1993,31 @@ function renderApiTestModels(){
     if(state) state.textContent = '';
     return;
   }
+  // 诊断默认用免费模型：付费模型必然 112（付费墙），拿它做默认只会每次
+  // 都显示失败，掩盖真正的连通性问题。
+  const freeIds = list.filter(m => m.is_free && m.enabled !== false).map(m => m.id);
+  const pinned = (window.DIAG_DEFAULT_MODEL || 'Qwen3.8-Flash');
+  const isPreferred = id => id === pinned || /qwen3\.8-flash/i.test(String(id));
   sel.innerHTML = list.map(m => {
     const suffix = m.enabled === false ? ' · 未开通' : (m.is_free ? ' · 免费' : '');
     return '<option value="' + esc(m.id) + '">' + esc(m.id) + suffix + '</option>';
   }).join('');
-  const preferred = list.find(m => m.enabled !== false) || list[0];
+  let defaultId = '';
+  if(list.some(m => m.id === pinned && m.enabled !== false)) defaultId = pinned;
+  if(!defaultId) defaultId = (freeIds.find(isPreferred) || freeIds[0] || '');
+  if(!defaultId){
+    const usable = list.find(m => m.enabled !== false) || list[0];
+    defaultId = usable ? usable.id : '';
+  }
   if(prev && list.some(m => m.id === prev)) sel.value = prev;
-  else if(preferred) sel.value = preferred.id;
+  else if(defaultId) sel.value = defaultId;
   if(state) state.textContent = '(' + list.length + ' 个模型)';
-  if(hint) hint.textContent = preferred && preferred.enabled === false
-    ? '当前没有已开通模型，测试会返回上游限制' : '';
+  if(hint){
+    const chosen = list.find(m => m.id === sel.value);
+    if(!freeIds.length) hint.textContent = '当前没有可用的免费模型，诊断可能因付费墙失败';
+    else if(chosen && chosen.is_free) hint.textContent = '诊断默认使用免费模型，不消耗付费额度';
+    else hint.textContent = '';
+  }
 }
 
 async function refreshApiTestModels(btn){
@@ -2064,9 +2079,9 @@ async function runApiConnectivityTest(btn){
   const modelEl = document.getElementById('apiTestModel');
   const msgEl = document.getElementById('apiTestMessage');
   const box = document.getElementById('apiTestResult');
-  const model = modelEl ? modelEl.value : '';
+  const model = (modelEl ? modelEl.value : '')
+    || window.DIAG_DEFAULT_MODEL || 'Qwen3.8-Flash';
   const message = msgEl ? String(msgEl.value || '').trim() : '';
-  if(!model){ toast('请选择测试模型', 'warn'); return; }
   if(!message){ toast('请输入测试消息', 'warn'); return; }
   if(btn){ btn.disabled = true; btn.textContent = '测试中...'; }
   if(box){
@@ -3866,6 +3881,7 @@ async function loadSettings(showToast){
     renderProxyPool(data.proxy_pool || null);
     renderAccountProxyBindings(data.account_proxy_bindings || [],
                                data.proxy_pool || null);
+    if(data.diag_default_model) window.DIAG_DEFAULT_MODEL = data.diag_default_model;
     if(showToast) toast('设置已刷新', 'ok');
   } catch(e) {
     if(showToast) toast('读取设置失败: ' + e.message, 'bad');

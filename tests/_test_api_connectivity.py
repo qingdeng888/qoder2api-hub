@@ -123,10 +123,24 @@ def main():
               no_key)
 
         P._local_api_test_key = lambda model: "local-test-key"
+        # 空模型 -> 用免费默认模型（Qwen3.8-Flash），而不是 400
         empty = P.run_api_connectivity_test(
             "", "test", max_tokens=16, port=port)
-        check("空模型 -> 400", not empty["ok"] and empty["status"] == 400,
-              empty)
+        check("空模型 -> 自动使用免费默认模型",
+              empty.get("model") == P.DIAG_DEFAULT_MODEL, empty.get("model"))
+        check("空模型 -> 真的发出请求并成功",
+              empty["ok"] is True, empty)
+        seen = _FakeGateway.seen[-1] if _FakeGateway.seen else {}
+        check("空模型时下游请求体用默认模型",
+              seen.get("body", {}).get("model") == P.DIAG_DEFAULT_MODEL,
+              seen.get("body", {}).get("model"))
+        check("默认诊断模型是免费模型 Qwen3.8-Flash",
+              P.DIAG_DEFAULT_MODEL == "Qwen3.8-Flash", P.DIAG_DEFAULT_MODEL)
+
+        explicit = P.run_api_connectivity_test(
+            "Qwen3.8-Max", "test", max_tokens=16, port=port)
+        check("显式指定模型时不被默认值覆盖",
+              explicit.get("model") == "Qwen3.8-Max", explicit.get("model"))
 
         closed = P.run_api_connectivity_test(
             "Qwen3.8-Flash", "test", max_tokens=16, port=1)

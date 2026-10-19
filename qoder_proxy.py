@@ -2131,6 +2131,8 @@ def runtime_settings_view():
         "proxy_pool": qoder_proxypool.status_view(),
         # Qoder 账号（≈参考项目的上游 Key）的出口绑定
         "account_proxy_bindings": account_proxy_bindings_view(),
+        # 诊断默认模型（面板「API 连通性测试」默认选中免费模型）
+        "diag_default_model": DIAG_DEFAULT_MODEL,
         # 403 自动禁用策略（面板展示用；窗口可用 QD_403_DISABLE_SECS 调整）
         "auto_disable_403": {
             "seconds": AUTO_DISABLE_403_SECS,
@@ -6210,6 +6212,23 @@ def allow_api_connectivity_test(client_ip, limit=10, window=60):
     return True
 
 
+def _free_model_names_for_diag(realm=None):
+    """诊断下拉优先展示的免费模型名（官方显示名，含 Qwen3.8-Flash）。"""
+    try:
+        entries = fetch_models(realm=realm or CURRENT_REALM)
+    except Exception:
+        return []
+    out = []
+    for mid, meta in entries:
+        meta = meta or {}
+        if not meta.get("is_free"):
+            continue
+        name = str(meta.get("display_name") or mid)
+        if name not in out:
+            out.append(name)
+    return out
+
+
 def _local_api_test_key(model):
     """挑一个本地 API Key 给 Playground 用（优先允许该模型的 Key）。"""
     try:
@@ -6249,18 +6268,55 @@ def _diag_reply_text(payload):
     return ""
 
 
-def run_api_connectivity_test(model, message, max_tokens=256, port=8790):
+# 诊断默认模型：免费模型才能反映"链路是否通"，付费模型必然 112（付费墙），
+# 拿它做默认只会让每次诊断都显示失败，掩盖真正的连通性问题。
+DIAG_DEFAULT_MODEL = os.environ.get("QD_DIAG_MODEL") or "Qwen3.8-Flash"
+
+
+def resolve_diag_model(model=None, realm=None):
+    """诊断用模型：显式指定优先；空则用免费默认（Qwen3.8-Flash）。
+
+    fetch_models() 返回的是**上游 key**（qfmodel），而面板/接口收的是**官方
+    模型名**（Qwen3.8-Flash），所以这里先用 resolve_upstream_key 换算再比。
+    默认模型不在本区目录时，回落到该区第一个免费模型（is_free）。
+    """
+    explicit = str(model or "").strip()
+    if explicit:
+        return explicit
+    fallback = DIAG_DEFAULT_MODEL
+    try:
+        entries = fetch_models(realm=realm or CURRENT_REALM)
+    except Exception:
+        return fallback
+    keys = {str(meta.get("key") or mid) for mid, meta in entries}
+    try:
+        default_key = qoder_catalog.resolve_upstream_key(
+            fallback, realm=realm or CURRENT_REALM)
+    except Exception:
+        default_key = ""
+    if not keys or default_key in keys:
+        return fallback
+    for mid, meta in entries:
+        if (meta or {}).get("is_free"):
+            return str((meta or {}).get("display_name") or mid)
+    return fallback
+
+
+def run_api_connectivity_test(model, message, max_tokens=256, port=8790,
+                              realm=None):
     """向本网关的 /v1/chat/completions 发一次真实请求。
 
     走完整链路：本地 API Key -> 网关鉴权/路由/账号/代理 -> 上游 -> 网关响应。
     不会把本地 Key 返回给前端；只返回状态、耗时、回复和原始响应。
+    model 为空时默认使用免费模型（Qwen3.8-Flash），保证诊断反映链路状态
+    而不是"没买套餐"。
     """
-    model = str(model or "").strip()
+    model = resolve_diag_model(model, realm=realm)
     message = str(message or "").strip() or "你是谁，出来干活了"
     started = time.time()
     if not model:
         return {"ok": False, "status": 400, "model": "",
-                "error": "请选择测试模型", "elapsed_ms": 0}
+                "error": "没有可用的诊断模型", "elapsed_ms": 0}
     try:
         limit = max(16, min(1024, int(max_tokens or 256)))
     except (TypeError, ValueError):
@@ -8008,10 +8064,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(
                 429, "too many connectivity tests; retry in a minute",
                 "rate_limit_error")
-        model = str(payload.get("model") or "").strip()
-        if not model:
-            return self._error(400, "请选择测试模型",
-                               "invalid_request_error")
+        relm = str(payload.get("realm") or "").strip().lower()
+        if relm not in ("intl", "cn"):
+            relm = None
+        # 空模型 -> 后端统一用免费默认模型（Qwen3.8-Flash）
+        model = resolve_diag_model(payload.get("model"), realm=relm)
         message = str(payload.get("message") or "").strip() \
             or "你是谁，出来干活了"
         try:
@@ -8023,7 +8080,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             port = 8790
         result = run_api_connectivity_test(
-            model, message, max_tokens=max_tokens, port=port)
+            model, message, max_tokens=max_tokens, port=port, realm=relm)
         log("api connectivity: model=%s ok=%s status=%s wall=%dms"
             % (model, result.get("ok"), result.get("status"),
                int(result.get("elapsed_ms") or 0)), tag="diag")

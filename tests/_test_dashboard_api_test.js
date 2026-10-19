@@ -35,6 +35,7 @@ const els = {
   apiTestResult: {innerHTML: ''},
 };
 global.document = {getElementById: id => els[id] || null};
+global.window = {DIAG_DEFAULT_MODEL: 'Qwen3.8-Flash'};
 const toasts = [];
 const toast = (msg, kind) => toasts.push([msg, kind]);
 let posted = null;
@@ -63,7 +64,9 @@ check('API 连通性函数可提取', api !== null);
 
 (async () => {
   if (api) {
+    // 顺序故意让付费模型排在前面：默认必须是免费模型，不是「第一个」
     api.setModels([
+      {id: 'Paid-Ultimate', enabled: true, is_free: false},
       {id: 'Qwen3.8-Flash', enabled: true, is_free: true},
       {id: 'Qwen3.8-Max', enabled: false, is_free: true},
     ]);
@@ -72,12 +75,15 @@ check('API 连通性函数可提取', api !== null);
       els.apiTestModel.innerHTML.includes('Qwen3.8-Flash')
       && els.apiTestModel.innerHTML.includes('Qwen3.8-Max'),
       els.apiTestModel.innerHTML);
-    check('默认选中第一个已开通模型',
+    check('默认选中免费模型 Qwen3.8-Flash（不是第一个付费模型）',
       els.apiTestModel.value === 'Qwen3.8-Flash', els.apiTestModel.value);
+    check('免费模型提示不消耗付费额度',
+      els.apiTestModelHint.textContent.includes('免费模型'),
+      els.apiTestModelHint.textContent);
     check('未开通模型有标记',
       els.apiTestModel.innerHTML.includes('未开通'),
       els.apiTestModel.innerHTML);
-    check('模型数量状态显示', els.apiTestState.textContent.includes('2 个模型'),
+    check('模型数量状态显示', els.apiTestState.textContent.includes('3 个模型'),
       els.apiTestState.textContent);
 
     els.apiTestModel.value = 'Qwen3.8-Flash';
