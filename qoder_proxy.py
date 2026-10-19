@@ -6223,6 +6223,11 @@ def run_api_connectivity_test(model, message, max_tokens=256, port=8790):
     reply = _diag_reply_text(payload)
     if ok and not reply:
         error_text = "上游返回 200，但响应中没有文本内容（可能是工具调用或空回复）"
+    elif not ok and is_diag_request():
+        # 诊断请求不等待排队：把「这次为什么没通」说清楚，别让用户以为要一直等
+        if "10605" in raw or "RESOURCE_LIMIT" in raw or "isQueued" in raw:
+            error_text += ("\n\n（注：连通性测试不会等待上游排队，所以这里直接显示"
+                           "当前状态；实际网关请求会按 retryAfterSeconds 自动等待重试。）")
     elapsed_ms = int((time.time() - started) * 1000)
     return {
         "ok": bool(ok and payload is not None and reply),
