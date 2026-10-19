@@ -1,0 +1,23 @@
+[Unit]
+Description=Qoder2API Hub (host-native, port 37006)
+Documentation=file://%h/qoder2api-hub/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# %h = 运行用户的家目录（默认 root 即 /root）；部署到其他路径请改这两行
+WorkingDirectory=%h/qoder2api-hub
+# 私密配置（API_KEY / PANEL_PASSWORD / HOST / PORT）由 run-local.sh 读取 .env.local
+ExecStart=%h/qoder2api-hub/run-local.sh
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+KillSignal=SIGINT
+LimitNOFILE=65535
+SyslogIdentifier=qoder-proxy
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

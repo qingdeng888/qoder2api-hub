@@ -27,3 +27,6 @@ Thumbs.db
 python/
 .tmp_*
 _acc/
+
+# ---- 宿主机原生部署私密配置（API Key / 面板密码）----
+.env.local

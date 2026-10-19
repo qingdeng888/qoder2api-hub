@@ -62,7 +62,13 @@ check("qoder_accounts.py 直连 urlopen 基线 == 0（出站统一走 _opener_fo
       n_direct == 0, n_direct)
 src_p = open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read()
 n_direct_p = src_p.count("urllib.request.urlopen(")
-check("qoder_proxy.py 直连 urlopen 基线 == 4（同上）", n_direct_p == 4, n_direct_p)
+# 代理池（v1.5.2+）后：chat / 模型清单 / 更新检查改走 _open_upstream()（池化
+# 选出口 + 传输层失败换代理）。剩余 2 处直连 = _open_upstream 的 env 分支
+# （池未启用时的旧行为）+ 启动时的本机端口自检（绝不能走代理）。
+check("qoder_proxy.py 直连 urlopen 基线 == 2（env 分支 + 本机端口自检）",
+      n_direct_p == 2, n_direct_p)
+check("qoder_proxy.py 上游请求走 _open_upstream（定义 + 3 个调用点）",
+      src_p.count("_open_upstream(") >= 4, src_p.count("_open_upstream("))
 
 print("")
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed" % (PASS + FAIL, PASS, FAIL))

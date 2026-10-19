@@ -1085,6 +1085,111 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       </table></div>
     </section>
 
+    <section id="sectionProxyPool">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:10px">
+        <div>
+          <h2 style="margin:0">出站代理池 <em id="setProxyState"></em></h2>
+          <div style="font-size:12px;color:var(--dim);margin-top:4px;line-height:1.6">
+            启用后，推理 / 模型清单 / 刷新 / 签到等上游请求按策略从池中选出口；传输层失败自动换下一个代理，
+            连续失败进入冷却，后台健康检查按间隔复活。关闭时沿用
+            <span class="mono">HTTPS_PROXY / HTTP_PROXY</span> 环境变量或直连。支持 HTTP/HTTPS 与 SOCKS4 / SOCKS4a / SOCKS5 / SOCKS5h。
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="sec mini" onclick="loadSettings(true)">刷新状态</button>
+          <button class="sec mini" onclick="testProxies(this)">测试全部</button>
+          <button class="sec mini" onclick="resetProxyStats(this)">清除冷却</button>
+        </div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:12px">
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--fg);background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px">
+          <input type="checkbox" id="ppEnabled" style="accent-color:var(--accent2)"> 启用代理池
+        </label>
+        <div>
+          <div style="font-size:11px;color:var(--dim);margin-bottom:4px">轮换策略</div>
+          <select id="ppMode" style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;color:var(--fg);font:inherit">
+            <option value="rotate">rotate（每请求轮换）</option>
+            <option value="sticky">sticky（按账号固定）</option>
+            <option value="random">random（随机）</option>
+            <option value="single">single（只用第一个）</option>
+          </select>
+        </div>
+        <div>
+          <div style="font-size:11px;color:var(--dim);margin-bottom:4px">单请求最多尝试</div>
+          <input id="ppAttempts" type="number" min="1" max="10"
+                 style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;color:var(--fg);font:inherit">
+        </div>
+        <div>
+          <div style="font-size:11px;color:var(--dim);margin-bottom:4px">失败阈值（进入冷却）</div>
+          <input id="ppThreshold" type="number" min="1" max="20"
+                 style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;color:var(--fg);font:inherit">
+        </div>
+        <div>
+          <div style="font-size:11px;color:var(--dim);margin-bottom:4px">冷却秒数（指数退避上限 8x）</div>
+          <input id="ppCooldown" type="number" min="5" step="5"
+                 style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;color:var(--fg);font:inherit">
+        </div>
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--fg);background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px">
+          <input type="checkbox" id="ppDirectFallback" style="accent-color:var(--accent2)"> 全部不可用时直连兜底
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--fg);background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px">
+          <input type="checkbox" id="ppHealthEnabled" style="accent-color:var(--accent2)"> 后台健康检查
+        </label>
+        <div>
+          <div style="font-size:11px;color:var(--dim);margin-bottom:4px">检查间隔（秒）</div>
+          <input id="ppHealthInterval" type="number" min="30" step="30"
+                 style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;color:var(--fg);font:inherit">
+        </div>
+        <div>
+          <div style="font-size:11px;color:var(--dim);margin-bottom:4px">检查超时（秒）</div>
+          <input id="ppHealthTimeout" type="number" min="2" max="120"
+                 style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;color:var(--fg);font:inherit">
+        </div>
+        <div style="grid-column:span 2;min-width:200px">
+          <div style="font-size:11px;color:var(--dim);margin-bottom:4px">健康检查目标（HTTP 响应即视为可达）</div>
+          <input id="ppHealthTarget" type="text" placeholder="https://api1.qoder.sh/"
+                 style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;color:var(--fg);font:inherit">
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <button onclick="saveProxyConfig(this)">保存代理池设置</button>
+        <span style="font-size:11px;color:var(--dim)">策略与健康检查保存在 <span class="mono">accounts/proxy_pool.json</span></span>
+      </div>
+
+      <div style="margin-top:16px">
+        <div style="font-size:12px;color:var(--dim);margin-bottom:6px;line-height:1.6">
+          批量添加：每行一个，支持 <span class="mono">备注|socks5://user:pass@host:port</span>；
+          <span class="mono">#</span> 开头的行视为注释；支持 http/https/socks4/socks4a/socks5/socks5h。
+        </div>
+        <textarea id="ppBulk" rows="3" placeholder="香港-01|http://user:pass@1.2.3.4:8080&#10;日本-02|socks5://user:pass@5.6.7.8:1080&#10;美国-03|socks4a://9.10.11.12:1080"
+                  style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;color:var(--fg);font:inherit;resize:vertical"></textarea>
+        <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <button onclick="addProxies(this)">批量添加</button>
+          <span id="ppAddResult" style="font-size:12px;color:var(--dim)"></span>
+        </div>
+      </div>
+
+      <div id="ppList" style="margin-top:14px"></div>
+      <div id="ppTestResult" style="font-size:12px;color:var(--dim);margin-top:8px;line-height:1.7"></div>
+    </section>
+
+    <section id="sectionAccountProxy">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:10px">
+        <div>
+          <h2 style="margin:0">账号代理绑定 <em id="setAccountProxyState"></em></h2>
+          <div style="font-size:12px;color:var(--dim);margin-top:4px;line-height:1.6">
+            每个 Qoder 账号相当于参考项目里的上游 Key，可单独决定出口：
+            <b>默认</b>跟随代理池策略、<b>自动</b>按账号固定、<b>绑定</b>固定某个代理、
+            <b>轮换</b>每次请求换代理、<b>直连</b>绕过代理池。绑定对推理、刷新、签到等
+            该账号的所有上游请求生效；代理池总开关关闭时不生效。
+          </div>
+        </div>
+        <button class="sec mini" onclick="loadSettings(true)">刷新账号</button>
+      </div>
+      <div id="accountProxyList"></div>
+    </section>
+
     <section>
       <h2>运行信息</h2>
       <table>
@@ -3563,6 +3668,9 @@ async function loadSettings(showToast){
     set('setFile', data.settings_file);
     set('setSettingsFile', data.settings_file);
     renderLimits(data.limits || null);   // 后端 GET /settings 带回 limits 时才允许保存（见 saveLimits 的护栏）
+    renderProxyPool(data.proxy_pool || null);
+    renderAccountProxyBindings(data.account_proxy_bindings || [],
+                               data.proxy_pool || null);
     if(showToast) toast('设置已刷新', 'ok');
   } catch(e) {
     if(showToast) toast('读取设置失败: ' + e.message, 'bad');
@@ -3980,6 +4088,449 @@ async function saveLimits(btn){
 }
 
 const MAIN_TABS = ['gateway', 'analytics', 'logs', 'agents', 'settings'];
+
+/* ---- 出站代理池（qoder_proxypool.py）----
+   语义：启用后上游请求从健康代理里按策略选出口；传输层失败换下一个代理，
+   连续失败/健康检查失败进入冷却。关闭时完全沿用环境变量代理/直连。 */
+let PROXY_POOL = null;
+let PROXY_SELECTED = new Set();   // 多选批量操作的 id 集合
+const PROXY_STATE_META = {
+  healthy:  {label: '健康',  color: 'var(--accent2)'},
+  cooling:  {label: '冷却中', color: 'var(--warn)'},
+  disabled: {label: '已停用', color: 'var(--dim)'},
+  unknown:  {label: '待检查', color: 'var(--accent)'},
+};
+
+function proxyStateBadge(row){
+  const meta = PROXY_STATE_META[row.state] || PROXY_STATE_META.unknown;
+  let text = meta.label;
+  if(row.state === 'cooling' && row.cooling_left) text += ' ' + row.cooling_left + 's';
+  return '<span class="badge s mini" style="color:' + meta.color + ';border-color:' + meta.color + '">' + text + '</span>';
+}
+
+function renderProxyPool(pp){
+  PROXY_POOL = pp || null;
+  const stateEl = document.getElementById('setProxyState');
+  if(!pp){
+    if(stateEl){ stateEl.textContent = '(未读取)'; stateEl.style.color = 'var(--warn)'; }
+    return;
+  }
+  const summary = pp.summary || {};
+  if(stateEl){
+    stateEl.textContent = pp.enabled
+      ? '(' + (summary.healthy || 0) + '/' + (summary.total || 0) + ' 健康)'
+      : '(未启用)';
+    stateEl.style.color = pp.enabled ? 'var(--accent2)' : 'var(--dim)';
+  }
+  const setVal = (id, value) => { const el = document.getElementById(id); if(el) el.value = value; };
+  const setChk = (id, value) => { const el = document.getElementById(id); if(el) el.checked = !!value; };
+  setChk('ppEnabled', pp.enabled);
+  setVal('ppMode', pp.mode || 'rotate');
+  setVal('ppAttempts', pp.max_attempts);
+  setVal('ppThreshold', pp.failure_threshold);
+  setVal('ppCooldown', pp.cooldown_sec);
+  setChk('ppDirectFallback', pp.direct_fallback);
+  const hc = pp.health_check || {};
+  setChk('ppHealthEnabled', hc.enabled);
+  setVal('ppHealthInterval', hc.interval_sec);
+  setVal('ppHealthTimeout', hc.timeout_sec);
+  setVal('ppHealthTarget', hc.target || '');
+
+  const box = document.getElementById('ppList');
+  if(!box) return;
+  const rows = pp.proxies || [];
+  const liveIds = new Set(rows.map(row => row.id));
+  PROXY_SELECTED = new Set(Array.from(PROXY_SELECTED).filter(id => liveIds.has(id)));
+  if(!rows.length){
+    PROXY_SELECTED.clear();
+    box.innerHTML = '<div class="empty" style="padding:18px 0">还没有代理。未启用代理池时上游直连，或沿用环境变量代理。</div>';
+    return;
+  }
+  const bulkBar = '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px">'
+    + '<span style="font-size:12px;color:var(--dim)">已选 <b id="ppSelCount" style="color:var(--fg)">0</b> 个</span>'
+    + '<button class="sec mini" data-pp-bulk disabled onclick="bulkToggleProxies(this, true)">批量启用</button>'
+    + '<button class="sec mini" data-pp-bulk disabled onclick="bulkToggleProxies(this, false)">批量停用</button>'
+    + '<button class="sec mini" data-pp-bulk disabled onclick="bulkTestProxies(this)">测试选中</button>'
+    + '<button class="sec mini" data-pp-bulk disabled onclick="bulkResetProxies(this)">清除选中冷却</button>'
+    + '<button class="sec mini" data-pp-bulk disabled style="color:var(--bad)" onclick="bulkDeleteProxies(this)">批量删除</button>'
+    + '</div>';
+  box.innerHTML = bulkBar + '<div class="table-wrap"><table>'
+    + '<thead><tr>'
+    + '<th style="width:34px"><input type="checkbox" id="ppSelectAll" title="全选" onclick="selectAllProxies(this.checked)"></th>'
+    + '<th style="text-align:left">状态</th><th style="text-align:left">备注</th>'
+    + '<th style="text-align:left">地址</th><th>延迟</th><th>失败</th>'
+    + '<th style="text-align:left">最近错误</th><th>操作</th></tr></thead><tbody>'
+    + rows.map(row => {
+        const latency = row.latency_ms == null ? '-' : (row.latency_ms + ' ms');
+        const err = row.last_error ? esc(row.last_error) : '<span style="color:var(--dim)">-</span>';
+        const toggle = row.enabled ? '停用' : '启用';
+        return '<tr>'
+          + '<td><input type="checkbox" class="pp-row-check" data-id="' + row.id + '"'
+          +   (PROXY_SELECTED.has(row.id) ? ' checked' : '')
+          +   ' onclick="selectProxyCheckbox(this)"></td>'
+          + '<td>' + proxyStateBadge(row) + '</td>'
+          + '<td>' + (row.label ? esc(row.label) : '<span style="color:var(--dim)">-</span>') + '</td>'
+          + '<td class="mono" style="font-size:12px">' + esc(row.address) + '</td>'
+          + '<td>' + latency + '</td>'
+          + '<td>' + (row.failures || 0) + ' / ' + (row.failures_total || 0) + '</td>'
+          + '<td style="text-align:left;font-size:12px;max-width:260px;word-break:break-all">' + err + '</td>'
+          + '<td style="white-space:nowrap">'
+          +   '<button class="sec mini" onclick="testProxies(this, \'' + row.id + '\')">测试</button> '
+          +   '<button class="sec mini" onclick="toggleProxy(\'' + row.id + '\', ' + (row.enabled ? 'false' : 'true') + ')">' + toggle + '</button> '
+          +   '<button class="sec mini" style="color:var(--bad)" onclick="deleteProxy(\'' + row.id + '\')">删除</button>'
+          + '</td></tr>';
+      }).join('')
+    + '</tbody></table></div>';
+  updateProxySelection();
+}
+
+function proxyRowIds(){
+  return Array.from(document.querySelectorAll('#ppList input.pp-row-check'))
+    .map(el => el.getAttribute('data-id')).filter(Boolean);
+}
+
+function selectedProxyIds(){
+  const live = new Set(proxyRowIds());
+  return Array.from(PROXY_SELECTED).filter(id => live.has(id));
+}
+
+function updateProxySelection(){
+  const ids = proxyRowIds();
+  const selected = ids.filter(id => PROXY_SELECTED.has(id));
+  const master = document.getElementById('ppSelectAll');
+  if(master){
+    master.checked = ids.length > 0 && selected.length === ids.length;
+    master.indeterminate = selected.length > 0 && selected.length < ids.length;
+  }
+  const count = document.getElementById('ppSelCount');
+  if(count) count.textContent = String(selected.length);
+  document.querySelectorAll('[data-pp-bulk]').forEach(btn => {
+    btn.disabled = selected.length === 0;
+  });
+}
+
+function selectProxyCheckbox(el){
+  const id = el.getAttribute('data-id');
+  if(!id) return;
+  if(el.checked) PROXY_SELECTED.add(id);
+  else PROXY_SELECTED.delete(id);
+  updateProxySelection();
+}
+
+function selectAllProxies(checked){
+  const ids = proxyRowIds();
+  ids.forEach(id => {
+    if(checked) PROXY_SELECTED.add(id);
+    else PROXY_SELECTED.delete(id);
+  });
+  document.querySelectorAll('#ppList input.pp-row-check').forEach(el => {
+    el.checked = !!checked;
+  });
+  updateProxySelection();
+}
+
+async function saveProxyConfig(btn){
+  const value = id => { const el = document.getElementById(id); return el ? el.value : ''; };
+  const checked = id => { const el = document.getElementById(id); return !!(el && el.checked); };
+  const number = (id, fallback) => {
+    const parsed = parseInt(value(id), 10);
+    return isNaN(parsed) ? fallback : parsed;
+  };
+  const config = {
+    enabled: checked('ppEnabled'),
+    mode: value('ppMode') || 'rotate',
+    max_attempts: number('ppAttempts', 3),
+    failure_threshold: number('ppThreshold', 3),
+    cooldown_sec: number('ppCooldown', 60),
+    direct_fallback: checked('ppDirectFallback'),
+    health_check: {
+      enabled: checked('ppHealthEnabled'),
+      interval_sec: number('ppHealthInterval', 300),
+      timeout_sec: number('ppHealthTimeout', 8),
+      target: (value('ppHealthTarget') || '').trim(),
+    },
+  };
+  if(btn){ btn.disabled = true; btn.textContent = '保存中...'; }
+  try{
+    const data = await postJSON('/settings/proxies/config', {config: config});
+    renderProxyPool(data.proxy_pool);
+    toast('代理池设置已保存', 'ok');
+  }catch(e){
+    toast('保存代理池设置失败: ' + e.message, 'bad');
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '保存代理池设置'; }
+  }
+}
+
+async function addProxies(btn){
+  const area = document.getElementById('ppBulk');
+  const text = area ? String(area.value || '').trim() : '';
+  if(!text){ toast('请先粘贴至少一个代理地址', 'warn'); return; }
+  if(btn){ btn.disabled = true; btn.textContent = '添加中...'; }
+  try{
+    const data = await postJSON('/settings/proxies/add', {text: text});
+    renderProxyPool(data.proxy_pool);
+    if(area) area.value = '';
+    let msg = '已添加 ' + (data.added || 0) + ' 个代理';
+    if((data.skipped || []).length) msg += '，跳过重复 ' + data.skipped.length + ' 个';
+    if((data.rejected || []).length) msg += '，拒绝 ' + data.rejected.length + ' 个';
+    toast(msg, data.added ? 'ok' : 'warn');
+    const out = document.getElementById('ppAddResult');
+    if(out){
+      out.innerHTML = (data.rejected || []).map(item =>
+        '<div style="color:var(--bad)">' + esc(item.input || '') + '：' + esc(item.reason || '') + '</div>'
+      ).join('');
+    }
+  }catch(e){
+    toast('添加代理失败: ' + e.message, 'bad');
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '批量添加'; }
+  }
+}
+
+function renderProxyTestResults(results){
+  results = results || [];
+  const ok = results.filter(item => item.ok).length;
+  toast('测试完成：' + ok + '/' + results.length + ' 可达',
+        ok === results.length ? 'ok' : 'warn');
+  const out = document.getElementById('ppTestResult');
+  if(out){
+    out.innerHTML = results.map(item =>
+      (item.ok ? '<span style="color:var(--accent2)">✓</span>'
+               : '<span style="color:var(--bad)">✗</span>')
+      + ' ' + esc(item.label || item.address) + ' · '
+      + (item.latency_ms || 0) + ' ms'
+      + (item.error ? ' · <span style="color:var(--bad)">' + esc(item.error) + '</span>' : '')
+    ).join('<br>');
+  }
+}
+
+async function testProxies(btn, id){
+  if(btn){ btn.disabled = true; btn.textContent = '测试中...'; }
+  try{
+    const data = await postJSON('/settings/proxies/test', id ? {ids: [id]} : {});
+    renderProxyPool(data.proxy_pool);
+    renderProxyTestResults(data.results);
+  }catch(e){
+    toast('测试代理失败: ' + e.message, 'bad');
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = id ? '测试' : '测试全部'; }
+  }
+}
+
+async function toggleProxy(id, enabled){
+  try{
+    const data = await postJSON('/settings/proxies/toggle', {ids: [id], enabled: enabled});
+    renderProxyPool(data.proxy_pool);
+    toast(enabled ? '代理已启用' : '代理已停用', 'ok');
+  }catch(e){
+    toast('更新代理状态失败: ' + e.message, 'bad');
+  }
+}
+
+async function deleteProxy(id){
+  if(!confirm('确定删除这个代理吗？删除后立即从池中移除。')) return;
+  try{
+    const data = await postJSON('/settings/proxies/delete', {ids: [id]});
+    renderProxyPool(data.proxy_pool);
+    toast('代理已删除', 'ok');
+  }catch(e){
+    toast('删除代理失败: ' + e.message, 'bad');
+  }
+}
+
+async function resetProxyStats(btn){
+  if(btn){ btn.disabled = true; btn.textContent = '清理中...'; }
+  try{
+    const data = await postJSON('/settings/proxies/reset', {});
+    renderProxyPool(data.proxy_pool);
+    toast('已清除全部冷却与失败计数', 'ok');
+  }catch(e){
+    toast('清除冷却失败: ' + e.message, 'bad');
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '清除冷却'; }
+  }
+}
+
+/* ---- 多选批量操作：勾选多行后启用/停用/测试/删除/清冷却 ---- */
+async function bulkToggleProxies(btn, enabled){
+  const ids = selectedProxyIds();
+  if(!ids.length){ toast('请先勾选代理', 'warn'); return; }
+  if(btn) btn.disabled = true;
+  try{
+    const data = await postJSON('/settings/proxies/toggle', {ids: ids, enabled: !!enabled});
+    renderProxyPool(data.proxy_pool);
+    toast((enabled ? '已启用 ' : '已停用 ') + (data.changed || []).length + ' 个代理', 'ok');
+  }catch(e){
+    toast((enabled ? '批量启用失败: ' : '批量停用失败: ') + e.message, 'bad');
+  }finally{
+    if(btn) btn.disabled = false;
+  }
+}
+
+async function bulkTestProxies(btn){
+  const ids = selectedProxyIds();
+  if(!ids.length){ toast('请先勾选代理', 'warn'); return; }
+  if(btn){ btn.disabled = true; btn.textContent = '测试中...'; }
+  try{
+    const data = await postJSON('/settings/proxies/test', {ids: ids});
+    renderProxyPool(data.proxy_pool);
+    renderProxyTestResults(data.results);
+  }catch(e){
+    toast('批量测试失败: ' + e.message, 'bad');
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '测试选中'; }
+  }
+}
+
+async function bulkResetProxies(btn){
+  const ids = selectedProxyIds();
+  if(!ids.length){ toast('请先勾选代理', 'warn'); return; }
+  if(btn) btn.disabled = true;
+  try{
+    const data = await postJSON('/settings/proxies/reset', {ids: ids});
+    renderProxyPool(data.proxy_pool);
+    toast('已清除选中代理的冷却与失败计数', 'ok');
+  }catch(e){
+    toast('清除选中冷却失败: ' + e.message, 'bad');
+  }finally{
+    if(btn) btn.disabled = false;
+  }
+}
+
+async function bulkDeleteProxies(btn){
+  const ids = selectedProxyIds();
+  if(!ids.length){ toast('请先勾选代理', 'warn'); return; }
+  if(!confirm('确定删除选中的 ' + ids.length + ' 个代理吗？此操作不可撤销。')) return;
+  if(btn) btn.disabled = true;
+  try{
+    const data = await postJSON('/settings/proxies/delete', {ids: ids});
+    ids.forEach(id => PROXY_SELECTED.delete(id));
+    renderProxyPool(data.proxy_pool);
+    toast('已删除 ' + (data.removed || 0) + ' 个代理', 'ok');
+  }catch(e){
+    toast('批量删除失败: ' + e.message, 'bad');
+  }finally{
+    if(btn) btn.disabled = false;
+  }
+}
+
+
+/* ---- 账号级代理绑定（Qoder 账号 ≈ 参考项目的上游 Key）----
+   模式对齐 opencode2api：默认跟随代理池 / auto 按账号固定 / bind 固定代理 /
+   rotate 每次请求轮换 / direct 强制直连。 */
+const ACCOUNT_PROXY_MODES = [
+  {value: '',       label: '默认（跟随代理池）'},
+  {value: 'auto',   label: '自动（按账号固定）'},
+  {value: 'bind',   label: '绑定指定代理'},
+  {value: 'rotate', label: '每次请求轮换'},
+  {value: 'direct', label: '直连（不走代理池）'},
+];
+
+function renderAccountProxyBindings(bindings, pp){
+  const box = document.getElementById('accountProxyList');
+  if(!box) return;
+  bindings = bindings || [];
+  const proxies = (pp && pp.proxies) || [];
+  const state = document.getElementById('setAccountProxyState');
+  if(state){
+    state.textContent = bindings.length
+      ? ('(' + bindings.length + ' 个账号)') : '(无账号)';
+    state.style.color = bindings.length ? 'var(--accent2)' : 'var(--dim)';
+  }
+  if(!bindings.length){
+    box.innerHTML = '<div class="empty" style="padding:18px 0">还没有 Qoder 账号。添加账号后可在这里单独指定出口。</div>';
+    return;
+  }
+  box.innerHTML = '<div class="table-wrap"><table>'
+    + '<thead><tr><th style="text-align:left">账号</th><th>区域</th>'
+    + '<th>出口模式</th><th>绑定代理</th><th>操作</th></tr></thead><tbody>'
+    + bindings.map(item => {
+        const mode = item.proxyMode || '';
+        const proxyId = item.proxyId || '';
+        let found = false;
+        let options = '<option value="">— 不绑定 —</option>';
+        proxies.forEach(proxy => {
+          const label = (proxy.label ? proxy.label + ' · ' : '')
+            + proxy.address + (proxy.enabled === false ? '（已停用）' : '');
+          if(proxy.id === proxyId) found = true;
+          options += '<option value="' + esc(proxy.id) + '"'
+            + (proxy.id === proxyId ? ' selected' : '') + '>'
+            + esc(label) + '</option>';
+        });
+        if(proxyId && !found){
+          options += '<option value="' + esc(proxyId) + '" selected>'
+            + '（已失效）' + esc(proxyId) + '</option>';
+        }
+        const modeSelect = '<select class="ap-mode" onchange="syncAccountProxyMode(this)"'
+          + ' style="background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:6px 8px;color:var(--fg);font:inherit">'
+          + ACCOUNT_PROXY_MODES.map(option =>
+              '<option value="' + option.value + '"'
+              + (option.value === mode ? ' selected' : '') + '>'
+              + option.label + '</option>').join('')
+          + '</select>';
+        return '<tr data-uid="' + esc(item.uid) + '">'
+          + '<td><div style="font-weight:600;color:var(--fg)">'
+          +   esc(item.nickname || item.uid)
+          +   '</div><div class="mono" style="font-size:11px;color:var(--dim)">'
+          +   esc(item.uid) + '</div></td>'
+          + '<td>' + esc(item.realm || '-') + '</td>'
+          + '<td>' + modeSelect + '</td>'
+          + '<td><select class="ap-proxy" ' + (mode === 'bind' ? '' : 'disabled')
+          +   ' style="background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:6px 8px;color:var(--fg);font:inherit;min-width:180px">'
+          +   options + '</select></td>'
+          + '<td><button class="sec mini" onclick="saveAccountProxyBinding(this)">保存</button></td>'
+          + '</tr>';
+      }).join('')
+    + '</tbody></table></div>'
+    + '<div style="font-size:11px;color:var(--dim);margin-top:6px;line-height:1.6">'
+    + 'auto = 按账号 UID 稳定选一个代理（失败时本次请求换下一个）；'
+    + 'bind = 固定代理（代理被删除或停用才回落到默认）；'
+    + 'rotate = 每次请求/重试换一个健康代理；direct = 该账号强制直连。'
+    + '</div>';
+}
+
+function syncAccountProxyMode(select){
+  const row = select.closest('tr');
+  if(!row) return;
+  const proxy = row.querySelector('.ap-proxy');
+  if(!proxy) return;
+  proxy.disabled = select.value !== 'bind';
+  if(!proxy.disabled && !proxy.value){
+    const first = Array.from(proxy.options).find(option => option.value);
+    if(first) proxy.value = first.value;
+  }
+}
+
+async function saveAccountProxyBinding(btn){
+  const row = btn.closest('tr');
+  if(!row) return;
+  const uid = row.getAttribute('data-uid');
+  const modeEl = row.querySelector('.ap-mode');
+  const proxyEl = row.querySelector('.ap-proxy');
+  const mode = modeEl ? modeEl.value : '';
+  const proxyId = (mode === 'bind' && proxyEl) ? proxyEl.value : '';
+  if(mode === 'bind' && !proxyId){
+    toast('请选择要绑定的代理', 'warn');
+    return;
+  }
+  btn.disabled = true;
+  try{
+    const data = await postJSON('/accounts/proxy-binding',
+      {uid: uid, mode: mode, proxy_id: proxyId});
+    if(data.account_proxy_bindings){
+      renderAccountProxyBindings(data.account_proxy_bindings, PROXY_POOL);
+    }else{
+      loadSettings();
+    }
+    toast('账号代理绑定已保存', 'ok');
+  }catch(e){
+    toast('保存账号代理绑定失败: ' + e.message, 'bad');
+  }finally{
+    if(btn) btn.disabled = false;
+  }
+}
+
 
 /* ---- 页面区块导航（wb 同款全套移植）----
    导航项完全由页面内的 section 现场生成：标题取该 section 首个 h2 的文本

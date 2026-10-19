@@ -2402,7 +2402,7 @@ def _camp_claimable24(self, force=False):
 
 
 def _claim_http24(url, data=None, method=None, headers=None, timeout=None,
-                  retries=None, log=None):
+                  retries=None, log=None, **kwargs):
     # 只打桩 HTTP 层：让真实的 claim_campaign（含兑换码提取/落盘）跑起来
     cid = url.rsplit("/", 2)[-2]
     _calls24.append((headers.get("cosy-user", "?"), cid))

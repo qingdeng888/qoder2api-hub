@@ -32,6 +32,7 @@ import uuid
 from qoder_fingerprint import (derive_id, generate_request_id,
                                derive_machine_token, derive_machine_type,
                                vm_status)
+import qoder_proxypool
 
 # ---------------------------------------------------------------------------
 # 区域常量（逆向自官方桌面/CLI 客户端）
@@ -1180,23 +1181,66 @@ def _proxy_map_from_env():
     return out
 
 
-def _opener_for_request():
-    """每请求现建 opener：代理 = 当前环境变量（空 = 直连）。
+def _env_opener():
+    """环境变量代理（#27：只看 env、忽略注册表、每次现读）。
 
-    「现建」是对 #27 固化行为的修复——默认 opener（urllib.request.urlopen）
-    首次使用时缓存代理配置；本函数让每次请求看到的环境变化立即生效。
+    环境变量是 socks4/socks4a/socks5/socks5h 时改用内置 SOCKS 隧道
+    （urllib 的 ProxyHandler 不认识 socks scheme）。
     """
+    socks_url = qoder_proxypool.env_socks_url()
+    if socks_url:
+        return qoder_proxypool.build_proxy_opener(socks_url)
     proxies = _proxy_map_from_env()
     return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
 
 
+def _outbound_opener(affinity=None, exclude=None, binding=None):
+    """选一次出口：代理池启用时用池（含账号级绑定），否则回退 env。"""
+    opener, entry, kind = qoder_proxypool.acquire(
+        affinity=affinity, exclude=exclude, binding=binding)
+    if kind == "env":
+        return _env_opener(), None, kind
+    return opener, entry, kind
+
+
+def _opener_for_request(affinity=None):
+    """每请求现建 opener：优先代理池，未启用/关闭时用环境变量（空 = 直连）。
+
+    「现建」是对 #27 固化行为的修复——默认 opener（urllib.request.urlopen）
+    首次使用时缓存代理配置；本函数让每次请求看到的环境变化立即生效。
+    """
+    opener, _entry, kind = _outbound_opener(affinity=affinity)
+    if opener is None:
+        raise urllib.error.URLError(
+            "proxy pool exhausted: no healthy proxy and direct fallback is off")
+    return opener
+
+
 def http_json(url, data=None, method=None, headers=None, timeout=30,
-              retries=3, backoff=1.0, log=None):
-    """urlopen + json decode with retries. 所有 openapi 调用统一走这里。"""
+              retries=3, backoff=1.0, log=None, account=None):
+    """urlopen + json decode with retries. 所有 openapi 调用统一走这里。
+
+    代理池启用时每次重试都会换下一个代理（传输层失败才算代理失败）；
+    未启用时行为与改动前一致：环境变量代理 / 直连。
+    """
     validate_public_http_url(url)
     attempts = max(1, int(retries or 1))
+    # 账号级绑定优先：auto 需要稳定的账号键（uid），bind 需要 proxy_id。
+    binding = account.proxy_binding() if account is not None else None
+    affinity = (account.uid if account is not None and account.uid
+                else qoder_proxypool.affinity_from_headers(headers))
+    tried = set()
     last = None
     for attempt in range(1, attempts + 1):
+        opener, entry, _kind = _outbound_opener(affinity=affinity,
+                                                exclude=tried,
+                                                binding=binding)
+        if opener is None:
+            last = last or urllib.error.URLError(
+                "proxy pool exhausted: no healthy proxy and direct fallback is off")
+            break
+        if entry:
+            tried.add(entry["id"])
         req = urllib.request.Request(
             url,
             data=data,
@@ -1204,11 +1248,15 @@ def http_json(url, data=None, method=None, headers=None, timeout=30,
             headers=headers or {},
         )
         try:
-            with _opener_for_request().open(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+            with opener.open(req, timeout=timeout) as resp:
+                data_obj = json.loads(resp.read().decode("utf-8"))
+            qoder_proxypool.report_success(entry)
+            return data_obj
         except Exception as exc:
+            qoder_proxypool.report_failure(entry, exc)
             last = exc
-            if attempt >= attempts or not _retryable(exc):
+            retryable = _retryable(exc) or qoder_proxypool.is_transport_error(exc)
+            if attempt >= attempts or not retryable:
                 break
             if log:
                 log("network retry %d/%d after %s" % (attempt, attempts, exc))
@@ -1239,6 +1287,17 @@ class Account(object):
         self.added_at = data.get("addedAt") or time.time()
         self.source = str(data.get("source") or "oauth")
         self.enabled = data.get("enabled", True)
+        # 账号级出站代理绑定（对齐 opencode2api 的 upstream key proxy_mode）：
+        # "" 跟随代理池 / auto 按账号固定 / bind 固定 proxy_id / rotate 每请求换 /
+        # direct 强制直连。旧账号文件没有这两个字段 -> 默认跟随代理池。
+        self.proxy_mode = str(data.get("proxyMode") or data.get("proxy_mode")
+                              or "").strip().lower()
+        if self.proxy_mode not in qoder_proxypool.ACCOUNT_PROXY_MODES:
+            self.proxy_mode = ""
+        self.proxy_id = str(data.get("proxyId") or data.get("proxy_id")
+                            or "").strip()
+        if self.proxy_mode != "bind":
+            self.proxy_id = ""
         self.last_error = str(data.get("lastError") or "")
         self.cooldown_until = float(data.get("cooldownUntil") or 0)
         # 按模型粒度的限流冷却：上游频控只针对单模型，不能拖垮整个账号。
@@ -1302,6 +1361,14 @@ class Account(object):
         self.machine_headers_state = MACHINE_HEADERS_OMITTED
 
     # -- 持久化 ------------------------------------------------------------
+    def proxy_binding(self):
+        """账号级代理绑定（传给 qoder_proxypool.acquire）。"""
+        return {
+            "mode": self.proxy_mode or "",
+            "proxy_id": self.proxy_id if self.proxy_mode == "bind" else "",
+            "key": self.uid,
+        }
+
     def to_dict(self):
         return {
             "uid": self.uid,
@@ -1316,6 +1383,8 @@ class Account(object):
             "addedAt": self.added_at,
             "source": self.source,
             "enabled": self.enabled,
+            "proxyMode": self.proxy_mode,
+            "proxyId": self.proxy_id,
             "lastError": self.last_error,
             "cooldownUntil": self.cooldown_until,
             "credits": self.credits,
@@ -1340,6 +1409,8 @@ class Account(object):
             "platform": self.platform,
             "enabled": bool(self.enabled),
             "source": self.source,
+            "proxyMode": self.proxy_mode or "",
+            "proxyId": self.proxy_id or "",
             "tokenFamily": token_family(self),
             "expiresAt": exp,
             "expiresIn": _human_delta(exp - time.time()) if exp else None,
@@ -1880,7 +1951,7 @@ class Account(object):
         }
         try:
             data = http_json(url, data=json.dumps(payload).encode(), method="POST",
-                             headers=headers, timeout=30)
+                             headers=headers, timeout=30, account=self)
         except urllib.error.HTTPError as exc:
             try:
                 body = exc.read().decode("utf-8", "replace")
@@ -1961,7 +2032,7 @@ class Account(object):
         url = cfg["openapi"] + PATH_CHECKIN_STATUS
         try:
             q = http_json(url, method="GET", headers=self.headers(), timeout=15,
-                          retries=2)
+                          retries=2, account=self)
         except urllib.error.HTTPError as exc:
             try:
                 body = exc.read().decode("utf-8", "replace")
@@ -2045,7 +2116,7 @@ class Account(object):
         url = cfg["openapi"] + PATH_CHECKIN_CLAIM
         try:
             res = http_json(url, data=b"{}", method="POST",
-                            headers=self.headers(), timeout=15, retries=1)
+                            headers=self.headers(), timeout=15, retries=1, account=self)
         except urllib.error.HTTPError as exc:
             try:
                 body = exc.read().decode("utf-8", "replace")
@@ -2094,7 +2165,7 @@ class Account(object):
         url = get_realm_config(self.realm)["openapi"] + PATH_CAMPAIGNS
         try:
             return http_json(url, method="GET", headers=self.desktop_headers(),
-                             timeout=15, retries=1), 200, ""
+                             timeout=15, retries=1, account=self), 200, ""
         except urllib.error.HTTPError as exc:
             try:
                 body = exc.read().decode("utf-8", "replace")
@@ -2104,7 +2175,7 @@ class Account(object):
             if exc.code in (401, 403):
                 try:
                     return http_json(url, method="GET", headers=self.headers(),
-                                     timeout=15, retries=1), 200, ""
+                                     timeout=15, retries=1, account=self), 200, ""
                 except urllib.error.HTTPError as exc2:
                     return None, exc2.code, ("HTTP %d (desktop) / HTTP %d (plain)"
                                              % (exc.code, exc2.code))
@@ -2231,7 +2302,7 @@ class Account(object):
         url = cfg["openapi"] + (PATH_CAMPAIGN_REWARD % campaign_id)
         try:
             return http_json(url, method="GET", headers=self.desktop_headers(),
-                             timeout=20, retries=1)
+                             timeout=20, retries=1, account=self)
         except Exception as exc:
             return {"error": str(exc)}
 
@@ -2249,7 +2320,7 @@ class Account(object):
         url = cfg["openapi"] + (PATH_CAMPAIGN_CLAIM % campaign_id)
         try:
             r = http_json(url, data=b"{}", method="POST",
-                          headers=self.desktop_headers(), timeout=20, retries=1)
+                          headers=self.desktop_headers(), timeout=20, retries=1, account=self)
         except urllib.error.HTTPError as exc:
             try:
                 body = exc.read().decode("utf-8", "replace")
@@ -2527,7 +2598,7 @@ class Account(object):
         try:
             url = get_realm_config(other)["openapi"] + PATH_QUOTA
             q = http_json(url, method="GET", headers=self.headers(),
-                          timeout=20, retries=1)
+                          timeout=20, retries=1, account=self)
         except Exception:
             return ""
         if not isinstance(q, dict):
@@ -2545,7 +2616,7 @@ class Account(object):
         url = cfg["openapi"] + PATH_QUOTA
         hint = ""
         try:
-            q = http_json(url, method="GET", headers=self.headers(), timeout=30)
+            q = http_json(url, method="GET", headers=self.headers(), timeout=30, account=self)
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 # issue #40：403 常见于 WAF/出口被拦、或令牌区域标记错误。
@@ -2553,7 +2624,7 @@ class Account(object):
                 # 再给出可操作说明——不再把裸 403 当唯一信息。
                 try:
                     q = http_json(url, method="GET",
-                                  headers=self.desktop_headers(), timeout=30)
+                                  headers=self.desktop_headers(), timeout=30, account=self)
                 except Exception as exc2:
                     hint = self._other_realm_quota_hint()
                     return {
@@ -2698,7 +2769,7 @@ class Account(object):
         url = cfg["openapi"] + PATH_PLAN
         try:
             p = http_json(url, method="GET", headers=self.headers(), timeout=15,
-                          retries=1)
+                          retries=1, account=self)
         except Exception:
             return self.plan
         name = str(p.get("plan_tier_name") or p.get("user_type") or "")
@@ -2714,7 +2785,7 @@ class Account(object):
         url = cfg["openapi"] + PATH_PRO_ELIGIBILITY
         try:
             m = http_json(url, method="GET", headers=self.headers(), timeout=15,
-                          retries=1)
+                          retries=1, account=self)
             return True, bool(m.get("eligible"))
         except urllib.error.HTTPError as exc:
             if exc.code in (404, 403, 410):
@@ -2729,7 +2800,7 @@ class Account(object):
         url = cfg["openapi"] + PATH_PRO_CLAIM
         try:
             m = http_json(url, data=b"{}", method="POST", headers=self.headers(),
-                          timeout=15, retries=1)
+                          timeout=15, retries=1, account=self)
         except urllib.error.HTTPError as exc:
             try:
                 body = exc.read().decode("utf-8", "replace")
@@ -3190,6 +3261,21 @@ class AccountPool(object):
             account.delete()
             self.accounts.remove(account)
             return True
+
+    def set_proxy_binding(self, uid, mode="", proxy_id=""):
+        """更新账号级代理绑定并落盘；返回 Account（不存在抛 KeyError）。"""
+        mode = str(mode or "").strip().lower()
+        if mode not in qoder_proxypool.ACCOUNT_PROXY_MODES:
+            raise ValueError("unknown proxy mode: %s" % mode)
+        with self._lock:
+            account = self.get(uid)
+            if account is None:
+                raise KeyError(uid)
+            account.proxy_mode = mode
+            account.proxy_id = str(proxy_id or "").strip() \
+                if mode == "bind" else ""
+            account.save(self.dir)
+            return account
 
     # -- 限额护栏（task-61）------------------------------------------------
     def apply_quota_limits(self, limits=None, usage=None, free_models=None):

@@ -176,6 +176,36 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 >
 > 以上已在 **amd64 与 arm64**、真实官方镜像 + 真实 compose 下验证（issue #18 的作者与我们的独立复现）。
 
+### 6. 宿主机原生运行（调试推荐）
+
+本项目零 pip 依赖，可直接用系统 Python（3.9+）运行；改完 Python/dashboard 代码后 `systemctl restart` 秒级生效，不需要重新构建镜像，适合调试。
+
+```bash
+cd /root/qoder2api-hub
+cp .env.example .env.local
+chmod 600 .env.local
+vi .env.local              # 填 API_KEY / PANEL_PASSWORD / PORT
+./run-local.sh             # 前台运行，Ctrl+C 停止
+```
+
+注册 systemd（开机自启 + 崩溃自动拉起）：
+
+```bash
+sudo cp qoder2api-hub.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now qoder2api-hub
+systemctl status qoder2api-hub
+journalctl -u qoder2api-hub -f        # 实时日志
+sudo systemctl restart qoder2api-hub  # 改完代码后重启
+```
+
+说明：
+
+- `accounts/`、`usage/` 仍是仓库下的数据目录，Docker 与原生模式共用同一份数据；
+- `.env.local` 权限 0600 且已加入 `.gitignore`；优先级为 **命令行参数 > `.env.local` > 脚本默认值**，临时换端口可 `PORT=38000 ./run-local.sh`；
+- 原生模式优先使用仓库下 `umid/runtime-info`（可从镜像复制或用 `python _install_umid.py` 生成）；缺失时自动退回派生身份，不影响请求；
+- Docker 与原生模式二选一，切换前先停掉另一个（`docker compose down` / `systemctl stop qoder2api-hub`）。
+
 ---
 
 ## 二、核心特性详解
@@ -198,7 +228,34 @@ docker run -d --name qoder-proxy --restart unless-stopped \
   - **Windows 系统代理与「首次请求固化」（#27 修复）**：Python 的 urllib 在 Windows 上会**连带读 WinINET 注册表**里的系统代理（不只是环境变量），且默认 opener 会在**进程首次请求时把当时的代理配置固化**——如果网关启动时你的代理工具开着（如 Clash，127.0.0.1:7897）、之后又关掉它，长驻进程会一直去连那个已无人监听的端口（WinError 10061），token 刷新与全部模型调用全挂，直到重启网关。**本仓现行策略**：出站统一走自建 opener（_opener_for_request），**代理只看环境变量、忽略注册表，且每请求现读**（无固化——开关代理对下一次请求立即生效）。
   - **受影响的人怎么办**：如果你平时**靠系统代理才能上网**（且从没设过代理环境变量）——升级后需要显式设置一次：Windows 执行 setx HTTPS_PROXY http://127.0.0.1:7897（端口换成你自己的代理工具），然后重启网关；只想本地直连的**无需任何操作**。**TUN / fake-ip 型代理**（Clash 等）在网络层透明转发，**无需任何设置**、行为不变。
   - 若你用的是 **fake-ip 模式的透明代理**（Clash 等），网关已内置 `_FAKEIP_NETS` 把 fake-ip 网段视为有效，**不会**因为 DNS 把域名解析成内网地址而拒绝请求。
-  - 说明：我们**没有**做「按账号绑定不同出口」那套（每账号独立代理槽 + 出口情报）—— 因为账号都由你本机导入、出口天然相同，实测也没有「上游按 IP 风控」的信号。**将来若真撞上按 IP 风控**，最小方案是给账号加一个可选 `proxy` 字段并让出站走 `ProxyHandler`（约 25 行）。
+  - 说明：**出站代理池（v1.5.2 起，可选）** 已参考 [opencode2api](https://github.com/qingdeng888/opencode2api) 的代理列表 + 轮换 + 健康/冷却模型实现：配置存 `accounts/proxy_pool.json`，面板「设置 → 出站代理池」可启用/批量添加/测试/停用/删除；列表支持全选与多选，选中后可批量启用、停用、测试、清除冷却、删除。策略 `rotate`（每请求轮换）/ `sticky`（按账号凭证哈希固定）/ `random` / `single`；单请求传输层失败自动换下一个代理（`max_attempts`），连续失败达到阈值进入指数冷却，后台健康检查按间隔并发探测并在成功时立即复活，全部不可用时可选直连兜底。覆盖推理、模型清单、更新检查与账号侧出站（token 刷新/额度/签到）。**仍未做**「每个账号静态绑定独立代理槽」的固定映射（sticky 只是在健康代理集合内按账号稳定选路，代理冷却时会自动换）。协议支持 **http / https / socks4 / socks4a / socks5 / socks5h**（均支持 `user:pass@`；SOCKS4 只用 userid），SOCKS 握手由 [qoder_socks.py](qoder_socks.py) 用标准库 socket 实现，**仍然零第三方依赖**；环境变量 `HTTPS_PROXY=socks5://...` 也直接生效。
+  - 手工配置示例（面板保存时 `id` 会自动补齐；`url` 里的密码只存服务端，面板与日志只显示 `***@host:port`）：
+    ```json
+    {
+      "enabled": true,
+      "mode": "rotate",
+      "max_attempts": 3,
+      "failure_threshold": 3,
+      "cooldown_sec": 60,
+      "direct_fallback": true,
+      "health_check": {
+        "enabled": true, "interval_sec": 300,
+        "timeout_sec": 8, "target": "https://api1.qoder.sh/"
+      },
+      "proxies": [
+        {"label": "HK-01", "url": "http://user:pass@1.2.3.4:8080", "enabled": true},
+        {"label": "JP-02", "url": "socks5://user:pass@5.6.7.8:1080", "enabled": true}
+      ]
+    }
+    ```
+
+- **账号级出口绑定（对齐 opencode2api 的上游 Key `proxy_mode`）**：每个 Qoder 账号可单独指定出口，配置落在账号 JSON 的 `proxyMode` / `proxyId`，面板「设置 → 账号代理绑定」可改，保存后立即对推理、token 刷新、额度/签到等**该账号的全部上游请求**生效：
+  - **默认**（空）：跟随代理池全局策略（`rotate` / `sticky` / `random` / `single`）；
+  - **`auto`**：按账号 UID 稳定选一个代理；该代理失败/冷却时本次请求换下一个；
+  - **`bind`**：固定到指定 `proxy_id`；即使该代理冷却也照用（与参考项目一致，不偷偷换出口），只有代理被删除/停用才回落到默认策略；
+  - **`rotate`**：每次请求/重试都换一个健康代理；
+  - **`direct`**：该账号强制直连，绕过代理池。
+  - 代理池总开关关闭时这些绑定不生效（仍走环境变量代理/直连）。
 
 - **积分汇总（只读，给下游轮询用）**：`GET /credits/summary` —— 走 **API-key 级鉴权**（`_key_ok`：API Key 或面板会话均可，未设 Key 时放行），**只返回本地已登记的 `credits`，绝不触发任何上游查询**（对照 `GET /accounts/credits`：那个会**逐号强制刷新**，适合作者手动点、不适合机器轮询）。
   - 返回：`{ by_realm: {cn, intl}, totals: {remain, accounts}, accounts: [{uid, nickname, realm, credits_remain, credits_used, credits_size, registered_at}], note }`；

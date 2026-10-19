@@ -48,6 +48,7 @@ import qoder_accounts
 import qoder_agents
 import qoder_anthropic
 import qoder_catalog
+import qoder_proxypool
 import qoder_settings
 import qoder_sign
 from qoder_sign import qoder_encode, SESSIONS
@@ -161,6 +162,78 @@ def validate_public_http_url(url, allow_local=False):
             raise ValueError(
                 "requests to private/reserved address %s are not allowed" % ip)
     return url
+
+
+def _open_upstream(req, timeout, affinity=None, binding=None):
+    """带代理池出站：传输层失败时换下一个代理重试（HTTP 响应不算失败）。
+
+    代理池未启用时走 ``urllib.request.urlopen``（保持 #27 之前的 env 代理
+    行为与测试桩兼容）；启用后按池策略选出口，失败自动切换，最多
+    ``max_attempts`` 次；全部失败且允许直连时用无代理 opener 兜底一次。
+    """
+    attempts = qoder_proxypool.max_attempts()
+    tried = set()
+    direct_used = False
+    last = None
+    # urllib 的 ProxyHandler 会就地改写 Request（host/type/_tunnel_host），
+    # 同一个 Request 换 opener 重试会带着上一次的代理状态去连死端口。
+    # 因此重试必须用原始 URL/方法/头重建一个全新的 Request。
+    url = req.full_url
+    data = req.data
+    method = req.get_method()
+    base_headers = dict(req.headers)
+    base_headers.update(getattr(req, "unredirected_hdrs", {}) or {})
+    for attempt in range(1, attempts + 1):
+        opener, entry, kind = qoder_proxypool.acquire(affinity=affinity,
+                                                      exclude=tried,
+                                                      binding=binding)
+        if kind == "exhausted":
+            break
+        if kind == "direct":
+            if direct_used:
+                break
+            direct_used = True
+        if entry:
+            tried.add(entry["id"])
+        attempt_req = urllib.request.Request(
+            url, data=data, headers=base_headers, method=method)
+        try:
+            if kind == "env":
+                socks_url = qoder_proxypool.env_socks_url()
+                if socks_url:
+                    resp = qoder_proxypool.build_proxy_opener(
+                        socks_url).open(attempt_req, timeout=timeout)
+                else:
+                    resp = urllib.request.urlopen(attempt_req,
+                                                  timeout=timeout)
+            elif kind == "direct":
+                resp = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({})).open(attempt_req,
+                                                           timeout=timeout)
+            else:
+                resp = opener.open(attempt_req, timeout=timeout)
+            qoder_proxypool.report_success(entry)
+            return resp
+        except urllib.error.HTTPError:
+            # 收到 HTTP 响应 = 代理链路是通的；业务错误交给上层分类。
+            qoder_proxypool.report_success(entry)
+            raise
+        except Exception as exc:
+            qoder_proxypool.report_failure(entry, exc)
+            last = exc
+            if not qoder_proxypool.is_transport_error(exc):
+                raise
+            if attempt >= attempts:
+                break
+            if entry is not None:
+                log("proxy pool: %s failed (%s); retrying with another exit"
+                    % (qoder_proxypool.mask_url(entry["url"]), exc),
+                    level="WARN", tag="proxy")
+            time.sleep(0.15 * attempt)
+    if last is not None:
+        raise last
+    raise urllib.error.URLError(
+        "proxy pool exhausted: no healthy proxy and direct fallback is off")
 
 
 # 双区自动路由（#26 步1/步2）：默认开启。**显式指定永远优先** —— 本开关只作用于
@@ -2000,6 +2073,27 @@ def gateway_models_for_agents(realm=None):
     return {"models": out[:80]}
 
 
+def account_proxy_bindings_view():
+    """账号级代理绑定视图（设置页「账号代理绑定」用）。"""
+    if POOL is None:
+        return []
+    try:
+        accounts = list(POOL.accounts)
+    except Exception:
+        return []
+    out = []
+    for account in accounts:
+        out.append({
+            "uid": account.uid,
+            "nickname": account.nickname or (account.uid[:8] if account.uid else "?"),
+            "realm": account.realm,
+            "enabled": bool(account.enabled),
+            "proxyMode": account.proxy_mode or "",
+            "proxyId": account.proxy_id or "",
+        })
+    return out
+
+
 def runtime_settings_view():
     """Current panel-visible settings (never returns the password or the key)."""
     key = API_KEY or ""
@@ -2032,6 +2126,10 @@ def runtime_settings_view():
         # global/intl/cn，未设时全为 0/None），面板读到即可安全回显、再保存不会
         # 把已有阈值覆盖成默认值。
         "limits": qoder_settings.limits_data(ACCOUNTS_DIR),
+        # 出站代理池：开关、策略、健康状态（地址已脱敏，不回传代理密码）
+        "proxy_pool": qoder_proxypool.status_view(),
+        # Qoder 账号（≈参考项目的上游 Key）的出口绑定
+        "account_proxy_bindings": account_proxy_bindings_view(),
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": qoder_settings.settings_path(ACCOUNTS_DIR),
@@ -2373,7 +2471,8 @@ def read_dynamic_models(realm=None):
             url = validate_public_http_url(raw_url)
             req = urllib.request.Request(url, data=sign_body.encode("utf-8"),
                                          method="GET", headers=headers)
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with _open_upstream(req, 15, affinity=account.uid,
+                                binding=account.proxy_binding()) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             break
         except Exception as exc:
@@ -3021,7 +3120,7 @@ def check_for_update(force=False):
             "Accept": "application/vnd.github+json",
             "User-Agent": "qoder-proxy-update-check",
         })
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with _open_upstream(req, 8, affinity="update-check") as resp:
             data = json.loads(resp.read().decode("utf-8"))
         tag = str(data.get("tag_name") or "").strip()
         info.update({
@@ -5166,7 +5265,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                 req = urllib.request.Request(chat_url,
                                              data=encoded.encode("utf-8"),
                                              method="POST", headers=headers)
-                resp = urllib.request.urlopen(req, timeout=600)
+                resp = _open_upstream(req, 600, affinity=account.uid,
+                                      binding=account.proxy_binding())
                 break
             except urllib.error.HTTPError as exc:
                 try:
@@ -7339,6 +7439,77 @@ class Handler(BaseHTTPRequestHandler):
             self._error(400, "invalid JSON body", "invalid_request_error")
             return None
 
+    def _handle_proxy_pool(self, path):
+        """出站代理池面板端点。
+
+        POST /settings/proxies/{config|add|delete|toggle|test|reset|reload}
+        —— 统一返回最新 status_view()，前端一次渲染。
+        """
+        payload = self._payload_or_error()
+        if payload is None:
+            return
+        action = path[len("/settings/proxies"):].strip("/") or "status"
+        ids = payload.get("ids")
+        if ids is not None and not isinstance(ids, list):
+            return self._error(400, "ids must be a list",
+                               "invalid_request_error")
+        try:
+            result = {}
+            if action == "status":
+                pass
+            elif action == "config":
+                patch = payload.get("config")
+                if not isinstance(patch, dict):
+                    return self._error(400, "config must be an object",
+                                       "invalid_request_error")
+                qoder_proxypool.update_config(patch)
+                result["saved"] = True
+            elif action == "add":
+                values = payload.get("values")
+                if not isinstance(values, list):
+                    values = []
+                text = payload.get("text")
+                if isinstance(text, str):
+                    values = list(values) + text.splitlines()
+                if not values:
+                    return self._error(400, "请至少填写一个代理地址",
+                                       "invalid_request_error")
+                result.update(qoder_proxypool.add_proxies(
+                    values, label=payload.get("label") or ""))
+            elif action == "delete":
+                result.update(qoder_proxypool.delete_proxies(ids or []))
+            elif action == "toggle":
+                enabled = payload.get("enabled")
+                if not isinstance(enabled, bool):
+                    return self._error(400, "enabled must be true or false",
+                                       "invalid_request_error")
+                result.update(qoder_proxypool.set_proxies_enabled(
+                    ids or [], enabled))
+            elif action == "test":
+                result["results"] = qoder_proxypool.test_proxies(ids or [])
+            elif action == "reset":
+                result.update(qoder_proxypool.reset_stats(ids or []))
+            elif action == "reload":
+                qoder_proxypool.reload()
+                result["reloaded"] = True
+            else:
+                return self._error(404, "unknown proxy pool action: %s"
+                                   % action, "invalid_request_error")
+            view = qoder_proxypool.status_view()
+            result["ok"] = True
+            result["proxy_pool"] = view
+            log("proxy pool %s: enabled=%s mode=%s proxies=%d"
+                % (action, view["enabled"], view["mode"],
+                   len(view["proxies"])), tag="proxy")
+            return self._json(200, result)
+        except ValueError as exc:
+            return self._error(400, str(exc), "invalid_request_error")
+        except Exception as exc:
+            log("proxy pool %s failed: %s" % (action, exc), level="ERROR",
+                tag="proxy")
+            return self._error(500, "proxy pool error: %s" % exc,
+                               "server_error")
+
     def _handle_settings_save(self):
         """Persist panel-managed settings from the web settings tab."""
         payload = self._payload_or_error()
@@ -7528,6 +7699,50 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(payload, dict):
             return self._error(400, "expected a JSON object",
                                "invalid_request_error")
+        if path == "/accounts/proxy-binding":
+            # 改账号出口绑定：必须面板会话（API Key 不能改路由配置）
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            uid = str(payload.get("uid") or "").strip()
+            mode = str(payload.get("mode") or "").strip().lower()
+            proxy_id = str(payload.get("proxy_id") or "").strip()
+            if not uid:
+                return self._error(400, "uid is required",
+                                   "invalid_request_error")
+            if mode not in qoder_proxypool.ACCOUNT_PROXY_MODES:
+                return self._error(
+                    400,
+                    "mode must be one of: %s"
+                    % ", ".join(repr(item) for item in
+                                qoder_proxypool.ACCOUNT_PROXY_MODES),
+                    "invalid_request_error")
+            if mode == "bind":
+                entry = qoder_proxypool.find_proxy(proxy_id)
+                if entry is None:
+                    return self._error(
+                        400, "绑定的代理不存在，请先在「出站代理池」中添加",
+                        "invalid_request_error")
+                if not entry.get("enabled", True):
+                    return self._error(
+                        400, "绑定的代理已停用，请先启用该代理",
+                        "invalid_request_error")
+            else:
+                proxy_id = ""
+            try:
+                account = POOL.set_proxy_binding(uid, mode, proxy_id)
+            except KeyError:
+                return self._error(404, "账号不存在: %s" % uid,
+                                   "invalid_request_error")
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            log("account proxy binding: uid=%s mode=%s proxy=%s"
+                % (uid, mode or "default", proxy_id or "-"), tag="proxy")
+            return self._json(200, {
+                "ok": True,
+                "account": account.public(),
+                "account_proxy_bindings": account_proxy_bindings_view(),
+            })
         if path in ("/accounts/credits", "/accounts/credits/fetch"):
             uid = payload.get("uid")
             realm = payload.get("realm")
@@ -8234,6 +8449,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(401, "panel password required",
                                    "invalid_request_error")
             return self._handle_settings_save()
+        if path.startswith("/settings/proxies"):
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            return self._handle_proxy_pool(path)
         if path in ("/panel/login", "/panel/logout", "/panel/password"):
             return self._handle_panel(path)
         if self._is_panel_route(path) and not self._panel_ok():
@@ -8622,6 +8842,16 @@ def main():
     POOL = qoder_accounts.AccountPool(ACCOUNTS_DIR, log=log)
     POOL.load()
     load_persisted_realm()
+    # 出站代理池：读 accounts/proxy_pool.json；启用时启动后台健康检查线程。
+    # 未启用 / 没有代理时保持原行为（env 代理或直连）。
+    qoder_proxypool.configure(ACCOUNTS_DIR, start_health=True)
+    _pp_view = qoder_proxypool.status_view()
+    if _pp_view["enabled"]:
+        log("proxy pool : on - %d proxies, mode=%s, direct fallback=%s"
+            % (len(_pp_view["proxies"]), _pp_view["mode"],
+               "on" if _pp_view["direct_fallback"] else "off"), tag="proxy")
+    else:
+        log("proxy pool : off (env proxy / direct)", tag="proxy")
     # task-61：把设置里的护栏阈值 + free 名单**同批**推给池（R3）；阈值全 0 时
     # 不产生任何副作用，任一 > 0 则惰性启动后台上新线程（G1 的恢复路径）。
     try:
