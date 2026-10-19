@@ -5127,6 +5127,17 @@ _CONTENT_POLICY_MARKERS = (
 #   ③ **请求内容问题**（内容审核、参数非法）：账号是好的，禁用毫无意义。
 AUTO_DISABLE_403_SECS = int(os.environ.get("QD_403_DISABLE_SECS") or 7200)
 
+# 付费墙标记：无论哪个模型，命中它都只说明"要钱"，不说明"号坏了"
+_PAYMENT_WALL_MARKERS = (
+    "pricingurl",
+    '"code":"112"',
+    '"code": "112"',
+    "insufficient_credit",
+    "quota_exceeded",
+    "payment_required",
+    "upgrade_required",
+)
+
 # 这些标记表示「这个号本身不被允许」而不是「这次请求有问题」
 _403_ACCOUNT_MARKERS = (
     "account_banned",
@@ -5231,6 +5242,11 @@ def should_auto_disable_403(detail, model=None):
     if not is_probe_model(model):
         # 非探测模型：不接受它的 403 作为「账号不可用」的证据
         return False, "paid_model"
+    # 探测模型本身撞上付费墙（112 / pricingUrl）：说明**探测模型选错了**
+    # （把收费模型设成了检测模型），不是账号不可用。此时不禁用账号，
+    # 否则一次配置失误会把整个池子停 2 小时。
+    if any(m.lower() in low for m in _PAYMENT_WALL_MARKERS):
+        return False, "probe_model_needs_payment"
     # 账号级标记先于 client_fault：permission_error / authentication_error 同时
     # 在两个名单里，但 403 语境下它们是「这个号没权限」，不是「这次请求参数错了」。
     if any(marker.lower() in low for marker in _403_ACCOUNT_MARKERS):

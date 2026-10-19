@@ -65,8 +65,8 @@ def main():
     check("付费模型 403（112）-> 不冷却、不禁用",
           not ok and why == "paid_model", (ok, why))
     ok, why = P.should_auto_disable_403(PRICING_403, model=FREE)
-    check("免费模型 403（112）-> 自动禁用",
-          ok and "403" in why, (ok, why))
+    check("探测模型撞付费墙（112）-> 不禁用（探测模型配错了，不是账号坏了）",
+          not ok and why == "probe_model_needs_payment", (ok, why))
     ok, why = P.should_auto_disable_403(
         '{"code":"403","message":"permission_error: not authorized"}',
         model=FREE)

@@ -52,6 +52,11 @@ def main():
               P.probe_model() == "Qwen3.8-Flash", P.probe_model())
         check("内置默认下 Qwen3.8-Flash 的 403 会禁用账号",
               P.should_auto_disable_403(DETAIL, model="Qwen3.8-Flash")[0])
+        # 探测模型撞付费墙：说明配置选错了模型，绝不禁用账号
+        pay = '{"code":"112","message":"{\\"pricingUrl\\":\\"https://qoder.com/pricing\\"}"}'
+        ok, why = P.should_auto_disable_403(pay, model="Qwen3.8-Flash")
+        check("探测模型撞付费墙 -> 不禁用（配置问题，不是账号问题）",
+              not ok and why == "probe_model_needs_payment", (ok, why))
         check("内置默认下其它模型（付费）的 403 不禁用",
               not P.should_auto_disable_403(DETAIL, model="Qwen3.8-Max")[0])
 
