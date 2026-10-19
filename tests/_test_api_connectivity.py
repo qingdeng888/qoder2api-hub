@@ -138,6 +138,22 @@ def main():
               all(P.allow_api_connectivity_test("api-diag-ip")
                   for _ in range(10))
               and P.allow_api_connectivity_test("api-diag-ip") is False)
+
+        # 诊断请求不应为了 10605 在信封层干等（thread-local 标记）
+        queue_detail = ('{"code":"403","message":"{\\"code\\":\\"10605\\",'
+                        '\\"retryAfterSeconds\\":30}"}')
+        fake_queue = P.UpstreamStatus(403, queue_detail)
+        P.set_diag_request(False)
+        normal_retry = P.should_retry_envelope(fake_queue, False, 0)
+        P.set_diag_request(True)
+        diag_retry = P.should_retry_envelope(fake_queue, False, 0)
+        P.set_diag_request(False)
+        check("10605 在正常请求里会重试（等待队列）",
+              normal_retry is True, normal_retry)
+        check("诊断请求不重试 10605（立即返回真实状态）",
+              diag_retry is False, diag_retry)
+        check("标记可重置（keep-alive 复用不会串到下一个请求）",
+              P.is_diag_request() is False)
     finally:
         P._local_api_test_key = orig_key
         server.shutdown()

@@ -5278,6 +5278,19 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
         if total > 1 and not any(m in detail for m in _CLIENT_FAULT_MARKERS):
             account.note_unknown_failure("envelope HTTP %s" % status_int)
 
+# 诊断请求（面板「API 连通性测试」）标记：thread-local，因为 Handler 是多线程的。
+# 诊断只关心「此刻能不能通」，不该为了一个 10605 在信封层干等 30s × N 轮。
+_DIAG_LOCAL = threading.local()
+
+
+def set_diag_request(flag):
+    _DIAG_LOCAL.diag = bool(flag)
+
+
+def is_diag_request():
+    return bool(getattr(_DIAG_LOCAL, "diag", False))
+
+
 def _envelope_queue_wait(exc):
     """信封层排队信号 -> 建议等待秒数（issue #38 后续 / #51 补充）。
 
@@ -5314,6 +5327,9 @@ def should_retry_envelope(exc, emitted_bytes, attempt):
         return False
     _q = _envelope_queue_wait(exc)
     if _q > 0:
+        # 诊断请求不等排队：把真实状态立刻还给面板，而不是挂 30s×N 轮。
+        if is_diag_request():
+            return False
         # queue: wait per retryAfterSeconds, allow more rounds than transient
         return (_q <= QUEUE_WAIT_MAX_SECS
                 and attempt < max(QUEUE_MAX_ROUNDS, TRANSIENT_MAX_RETRIES))
@@ -7456,6 +7472,7 @@ class Handler(BaseHTTPRequestHandler):
         # 会带回上一次 chat 的残留值 —— 那会让面板把「上一次的出口」当成「本次的」。
         self.realm_used = ""
         self.realm_reason = ""
+        set_diag_request(False)      # keep-alive 复用：GET 一律清掉诊断标记
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
@@ -8933,6 +8950,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(401, "panel password required",
                                    "invalid_request_error")
             return self._handle_proxy_pool(path)
+        # 每个请求入口重设诊断标记：连接会被 keep-alive 复用，绝不能串到
+        # 下一个真实用户请求上（那样真实请求就永远不等排队了）。
+        set_diag_request(bool(self.headers.get("X-Qoder-Diag")))
         if path in ("/panel/login", "/panel/logout", "/panel/password"):
             return self._handle_panel(path)
         if self._is_panel_route(path) and not self._panel_ok():
