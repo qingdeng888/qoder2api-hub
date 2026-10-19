@@ -1,105 +1,79 @@
 @echo off
 setlocal EnableExtensions
 rem ===========================================================
-rem  Qoder proxy - launcher (CN + Intl)
+rem  Qoder proxy - launcher (CN + Intl)  ** detached mode **
 rem  Usage: double-click, or  start-qoder-proxy.bat [port]
+rem
+rem  issue #50: the server now runs DETACHED. Closing this
+rem  window no longer stops it; use stop-qoder-proxy.bat.
 rem
 rem  ASCII-only on purpose: .bat files are read using the
 rem  console code page, so non-ASCII text breaks the parser.
-rem
-rem  NOTE: this script puts no %VAR% inside an if( ... ) block,
-rem  because a path containing ( or ) breaks the cmd.exe parser.
-rem  All checks use if/errorlevel/goto instead.
 rem ===========================================================
 
 set "PORT=%~1"
-rem 8788 = mimo-api-proxy.mjs, 8789 = wb-proxy - default to 8790.
 if "%PORT%"=="" set "PORT=8790"
 set "HERE=%~dp0"
 set "SCRIPT=%HERE%qoder_proxy.py"
+set "PIDFILE=%HERE%qoder-proxy.pid"
+set "LOGFILE=%HERE%qoder-proxy.log"
+set "ERRFILE=%HERE%qoder-proxy.err.log"
 
 if not exist "%SCRIPT%" goto no_script
 
 set "PYEXE="
 
-rem ---- 1) bundled runtime (ships with the zip) ----
 if not exist "%HERE%python\python.exe" goto try_path
 "%HERE%python\python.exe" --version >nul 2>nul
 if errorlevel 1 goto try_path
 set "PYEXE=%HERE%python\python.exe"
-goto run
+goto check_running
 
 :try_path
-rem ---- 2) python on PATH ----
 python --version >nul 2>nul
 if errorlevel 1 goto try_py
 set "PYEXE=python"
-goto run
+goto check_running
 
 :try_py
-rem ---- 3) py launcher ----
 py --version >nul 2>nul
-if errorlevel 1 goto try_codex
+if errorlevel 1 goto no_python
 set "PYEXE=py"
-goto run
+goto check_running
 
-:try_codex
-rem ---- 4) Codex bundled runtimes ----
-call :find_codex
-if defined PYEXE goto run
-
+:no_python
 echo [ERROR] No usable Python found.
-echo.
-echo Options:
-echo   1. Use the packaged zip, which already contains python\
-echo   2. Install Python 3.9+ from https://www.python.org/downloads/
-echo      (tick "Add python.exe to PATH" during setup)
-echo   3. Edit this file and set PYEXE to a full path, e.g.
-echo        set "PYEXE=C:\Python312\python.exe"
-echo.
+echo   Use the packaged zip (contains python\), or install Python 3.9+.
 pause
 exit /b 1
 
 :no_script
 echo [ERROR] qoder_proxy.py not found next to this script.
-echo         expected: %SCRIPT%
-echo.
 pause
 exit /b 1
 
-:find_codex
-if not exist "%USERPROFILE%\.cache\codex-runtimes" goto :eof
-for /d %%D in ("%USERPROFILE%\.cache\codex-runtimes\*") do call :probe "%%~D"
-goto :eof
+:check_running
+if not exist "%PIDFILE%" goto launch
+set /p OLDPID=<"%PIDFILE%"
+if "%OLDPID%"=="" goto launch
+tasklist /FI "PID eq %OLDPID%" 2>nul | find "%OLDPID%" >nul
+if errorlevel 1 goto launch
+echo [INFO] qoder-proxy already running (PID %OLDPID%).
+echo        Dashboard: http://127.0.0.1:%PORT%/
+echo        Stop it with: stop-qoder-proxy.bat
+goto end
 
-:probe
-if defined PYEXE goto :eof
-for /f "delims=" %%P in ('dir /b /s "%~1\python.exe" 2^>nul') do call :probe_one "%%~P"
-goto :eof
-
-:probe_one
-if defined PYEXE goto :eof
-"%~1" --version >nul 2>nul
-if errorlevel 1 goto :eof
-set "PYEXE=%~1"
-goto :eof
-
-:run
-echo ===========================================================
-echo   Qoder proxy
+:launch
+echo Starting qoder-proxy on port %PORT% (detached) ...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$p = Start-Process -FilePath '%PYEXE%' -ArgumentList '%SCRIPT%','--port','%PORT%','--pid-file','%PIDFILE%' -WindowStyle Hidden -RedirectStandardOutput '%LOGFILE%' -RedirectStandardError '%ERRFILE%' -PassThru; Start-Sleep -Milliseconds 1500; if ($p.HasExited) { Write-Host '[WARN] exited early - see qoder-proxy.log' } else { Write-Host ('[OK] started, PID ' + $p.Id) }"
 echo.
 echo   API      : http://127.0.0.1:%PORT%/v1
 echo   Dashboard: http://127.0.0.1:%PORT%/
+echo   Log      : %LOGFILE%
 echo.
-echo   Python   : %PYEXE%
-echo.
-echo   Keep this window open. Closing it stops the server.
-echo   Press Ctrl+C to stop.
-echo ===========================================================
-echo.
+echo   This window can be closed now - the server keeps running.
+echo   Stop it with: stop-qoder-proxy.bat
 
-"%PYEXE%" "%SCRIPT%" --port %PORT%
-
+:end
 echo.
-echo [server exited]
-pause
+if not "%QD_NO_PAUSE%"=="1" pause

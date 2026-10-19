@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.5.2-2496ED?style=flat-square" alt="Version 1.3.7">
+  <img src="https://img.shields.io/badge/Release-v1.5.4-2496ED?style=flat-square" alt="Version 1.3.7">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -111,7 +111,7 @@ ghcr.io/qingdeng888/qoder2api-hub:latest
 ghcr.io/qingdeng888/qoder2api-hub:sha-<短提交>
 ```
 
-打 `v*` tag 时还会追加 `1.5.2`、`1.5` 等语义化版本标签。`docker-compose.yml` 默认已指向该镜像：
+打 `v*` tag 时还会追加 `1.5.4`、`1.5` 等语义化版本标签。`docker-compose.yml` 默认已指向该镜像：
 
 ```bash
 # 1. 拉取并启动
@@ -153,7 +153,7 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 
 > **镜像与构建入口**：[**GHCR 包页面**](https://github.com/qingdeng888/qoder2api-hub/pkgs/container/qoder2api-hub)（tag、架构、拉取命令）· [**Releases**](https://github.com/qingdeng888/qoder2api-hub/releases) · [**Build Docker image**](https://github.com/qingdeng888/qoder2api-hub/actions/workflows/docker-publish.yml)（每次 push main 自动构建）。
 >
-> 可用 tag：**`latest`**（main 最新）· **`sha-<短提交>`**（钉死某次构建）· **`1.5.2` / `1.5`**（v* tag 构建）。镜像为 **linux/amd64 + linux/arm64** 双架构。
+> 可用 tag：**`latest`**（main 最新）· **`sha-<短提交>`**（钉死某次构建）· **`1.5.4` / `1.5`**（v* tag 构建）。镜像为 **linux/amd64 + linux/arm64** 双架构。
 
 ### 6. 宿主机原生运行（调试推荐）
 
@@ -531,6 +531,46 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/qingdeng888/qoder2api-hub/releases)。
+
+### v1.5.4-fork
+
+本仓库（fork: [qingdeng888/qoder2api-hub](https://github.com/qingdeng888/qoder2api-hub)）在上游 v1.5.4 基础上追加：
+
+**✨ 新增功能**
+
+- **出站代理池**（参考 [opencode2api](https://github.com/qingdeng888/opencode2api)）：`accounts/proxy_pool.json` + 面板「设置 → 出站代理池」，支持 HTTP/HTTPS/**SOCKS4/4a/5/5h**、轮换 `rotate`/`sticky`/`random`/`single`、失败换出口、连续失败指数冷却、后台健康检查、直连兜底；列表支持全选与多选批量启用/停用/测试/清冷却/删除。
+- **账号级出口绑定**：每个 Qoder 账号可选 `默认 / auto / bind / rotate / direct`，绑定随账号 JSON 持久化，覆盖推理、模型清单、刷新、额度与签到。
+- **API 连通性测试（Playground）**：面板「网关 → API 连通性测试」，用本地 Key 向本网关发一次真实请求，验证 Key → 路由/账号/代理 → 上游 → 响应全链路，展示状态、耗时、出口、回复与原始响应。
+- **账号备注**：账号池每个号可编辑本地备注（最多 120 字），导入导出往返保留。
+
+**🚀 部署**
+
+- **GitHub Actions 自动构建**：每次 push `main` 构建并推送 `ghcr.io/qingdeng888/qoder2api-hub:latest`（含 `sha-<短提交>`；打 `v*` tag 追加语义化版本），`docker-compose.yml` 默认使用该镜像。
+- **宿主机原生部署**：`run-local.sh` + `.env.local` + systemd unit，改代码后 `systemctl restart` 即生效，适合调试。
+
+### v1.5.4
+
+**🐛 问题修复**
+
+- **信封层排队（10605 / RESOURCE_LIMIT）没有等待**（#51 后续）：上游会先以 HTTP 200 建流、再在 SSE 信封里投递 `403 {isQueued:true, retryAfterSeconds:30, subCode:RESOURCE_LIMIT}`。v1.5.3 之前只在 **HTTP 层**做了排队等待，信封层仍按普通 403 冷却换号，换不到就把 403 直接丢给客户端（表现为 `request error: status=403 … 10605`）。
+  现在信封层同样识别排队：`should_retry_envelope` 对排队信号允许比瞬时重试更多轮（最多 `QUEUE_MAX_ROUNDS`），重开前按 `retryAfterSeconds+1` 等待；非流式聚合循环也留出了排队轮次；普通 403 的重试轮次**不变**。
+- **排队失败给可读文案**：10605 / RESOURCE_LIMIT 不再是一段嵌套 JSON，而是「上游排队中…已按 retryAfterSeconds 等待并重试，仍拿不到可用资源，请稍后重试」。
+
+**验证**：全量 **38 suites / 1353 checks / 0 failed**（新增 8 条：嵌套 detail 解析、信封排队识别、重试轮次、等待时长、普通 403 不变、已吐字节不重开、文案映射、聚合轮次）。
+
+### v1.5.3
+
+**🐛 问题修复**
+
+- **DeepSeek 原生 DSML 在 chat / Anthropic 流式里完全没有回读**（#51）：此前只有 Responses 路径有 DSML 解析，模型直接吐 `<|DSML|invoke name=...>` 时整段协议漏成正文（截图三例：闭标签+数组、完整 DSML 块、marker+杂字+数组）。现在流式出口新增一层 DSML 缓冲：遇到 DSML 就压住到流末统一解析，成功则补发散文 + `tool_calls` + `finish=tool_calls`；解析不出则原样透传并记 WARN。非流式 chat 侧也补了同样的回退。三种形态在 1/8/64/整段分帧下都能恢复、零泄漏。
+- **闭标签/杂字形态的解析容错**：允许 `</|DSML|...>` 前导闭标签、允许 marker 后跟杂字（如 `">`) 再进数组、允许数组开头的 `[` 丢失（取首个 `{` 到末个 `}` 重新成组）；严格校验（name 非空且命中声明、arguments 合法）一律保留。
+- **连接被拒绝只显示裸异常**（#52）：`<urlopen error [WinError 10061] ...>` 现在翻成可操作中文——点名目标地址、并给出三步排查（服务/端口、环境变量代理是否还在跑、地址是否写错）；10060 超时与 10054 重置同样处理。
+
+**✨ 新增功能**
+
+- **关掉窗口不再停服 + `stop-qoder-proxy.bat`**（#50）：`start-qoder-proxy.bat` 改为 `Start-Process` 分离启动（隐藏窗口、日志落 `qoder-proxy.log`），关掉启动窗口服务继续跑；新增 `stop-qoder-proxy.bat` 按 `qoder-proxy.pid` **精确停止**（先校验目标进程命令行含 `qoder_proxy.py`，绝不误杀其它 python）。服务端新增 `--pid-file`，启动写 PID、退出自动删除。
+
+**验证**：全量 **38 suites / 1345 checks / 0 failed**（新增 `tests/_test_issue50_51_52.py` 25 条）。
 
 ### v1.5.2
 
