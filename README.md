@@ -532,6 +532,22 @@ python _verify_models.py --base http://127.0.0.1:8790
 
 完整说明见 [Releases](https://github.com/qingdeng888/qoder2api-hub/releases)。
 
+### v1.5.4-fork.1
+
+**🐛 行为变更：403 自动禁用（2 小时，到期自愈）**
+
+- 上游对**账号级** 403（`account_banned` / `permission_error` / `forbidden` / `not authorized` 等）不再只是「冷却 60 秒后换号」——该账号会被**自动禁用**并进入 **2 小时**窗口（`QD_403_DISABLE_SECS` 可调，默认 `7200`），窗口到期后**自动恢复启用**，不需要人工点回来。
+- **模型级** 403（`code 112` / `pricingUrl`：该模型需要付费套餐）**只冷却这个模型 2 小时**，账号的其它模型照常可用。这条很关键：实测所有号打 `Qwen3.8-Max` 都返回 112、打 `Qwen3.8-Flash` 正常，按账号禁用会让整个池子瞬间全黑。
+- **不会误伤**的 403 保持原行为：
+  - `10605 / RESOURCE_LIMIT` 排队 —— 只按 `retryAfterSeconds` 冷却，绝不禁用（否则一次排队会把所有账号停 2 小时）；
+  - 内容审核（`DataInspectionFailed` 等）—— 是请求内容问题，账号本身没问题；
+  - 参数错（`invalid_parameter_error` 等）—— 同样是请求问题；
+  - 凭证彻底失效（`TOKEN_EXPIRE`）—— 沿用既有「停用且不自动恢复」语义，需要重新登录。
+- 状态落盘在账号 JSON 的 `disabledUntil` / `disabledReason`：重启后仍生效，到期后由 `ready()` / 面板列表自动翻回 `enabled=true`。
+- 面板账号行显示「**自动禁用 1h59m**」徽标 + 剩余时间与原因，并注明会自动恢复；手工点「启用」可立即覆盖这个窗口。
+
+**验证**：新增 `tests/_test_403_autodisable.py` 36 条断言（判定矩阵、2h 窗口、落盘、到期恢复、禁止误伤、选号跳过/恢复、面板文案、手工覆盖）。
+
 ### v1.5.4-fork
 
 本仓库（fork: [qingdeng888/qoder2api-hub](https://github.com/qingdeng888/qoder2api-hub)）在上游 v1.5.4 基础上追加：

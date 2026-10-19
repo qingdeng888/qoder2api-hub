@@ -2709,10 +2709,30 @@ function accountRow(a){
   const uidAttr = esc(String(a.uid || '').replace(/[^\w.@-]/g, ''));
   const nameAttr = esc(String(a.nickname || '').replace(/["'\\<>]/g, ''));
   const usage = USAGE_BY_ACCOUNT[a.uid] || {};
-  const state = !a.enabled ? '<span class="badge off">已停用</span>'
-              : a.inCooldown ? '<span class="badge warn">冷却 ' + (a.cooldownFor||0) + 's</span>'
+  // 403 自动禁用：显示剩余时间（会自动恢复），与手工「已停用」区分开
+  const fmtWait = sec => {
+    sec = Math.max(0, Math.round(Number(sec) || 0));
+    if(sec >= 3600) return Math.floor(sec / 3600) + 'h' + (Math.floor((sec % 3600) / 60) ? Math.floor((sec % 3600) / 60) + 'm' : '');
+    if(sec >= 60) return Math.floor(sec / 60) + 'm';
+    return sec + 's';
+  };
+  const autoOff = !a.enabled && Number(a.autoDisabledFor || 0) > 0;
+  const state = autoOff
+              ? '<span class="badge warn" title="' + esc(a.autoDisabledReason || '上游 403，自动禁用后会自动恢复') + '">自动禁用 ' + fmtWait(a.autoDisabledFor) + '</span>'
+              : !a.enabled ? '<span class="badge off">已停用</span>'
+              : a.inCooldown ? '<span class="badge warn">冷却 ' + fmtWait(a.cooldownFor || 0) + '</span>'
               : a.expiresIn === 'expired' ? '<span class="badge bad">已过期</span>'
               : '<span class="badge ok">可用</span>';
+  if(autoOff){
+    // 让「为什么被禁、还剩多久、会不会自己好」一眼可读
+    const note = '<div class="hint" style="color:var(--warn);margin:2px 0 0">'
+      + '403 自动禁用，剩余 ' + fmtWait(a.autoDisabledFor)
+      + ' 后自动恢复启用（无需手动操作）'
+      + (a.autoDisabledReason ? '：' + esc(a.autoDisabledReason) : '') + '</div>';
+    window.__autoOffNote = note;
+  } else {
+    window.__autoOffNote = '';
+  }
   const err = a.lastError ? '<div class="hint" style="color:var(--warn);margin:2px 0 0">' + esc(a.lastError) + '</div>' : '';
   const cred = a.credits;
   // issue #39：共享额度（团队/企业/池化）——上游返回时显示在套餐额度之后，
@@ -2760,6 +2780,7 @@ function accountRow(a){
     +   '<div style="font-weight:600;font-size:13px;color:var(--fg)">' + esc(a.nickname) + '</div>'
     + '<div class="mono" style="color:var(--dim);font-size:11px">' + esc(a.uid.slice(0,8)) + ' · ' + esc(a.source) + ' · 到期 ' + esc(a.expiresIn || '?') + '</div>'
     + remarkLine
+    + (window.__autoOffNote || '')
     + (a.machineId ? ('<div class="mono" style="color:var(--dim);font-size:10px;margin-top:2px" title="由账号UID稳定派生的专属设备码，防多号关联风控">设备码: ' + esc(a.machineId.slice(0,14)) + '...</div>') : '')
     + err + '</td>'
     + '<td style="text-align:center">' + state + '</td>'

@@ -2131,6 +2131,12 @@ def runtime_settings_view():
         "proxy_pool": qoder_proxypool.status_view(),
         # Qoder 账号（≈参考项目的上游 Key）的出口绑定
         "account_proxy_bindings": account_proxy_bindings_view(),
+        # 403 自动禁用策略（面板展示用；窗口可用 QD_403_DISABLE_SECS 调整）
+        "auto_disable_403": {
+            "seconds": AUTO_DISABLE_403_SECS,
+            "hours": round(AUTO_DISABLE_403_SECS / 3600.0, 2),
+            "env": "QD_403_DISABLE_SECS",
+        },
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": qoder_settings.settings_path(ACCOUNTS_DIR),
@@ -5103,6 +5109,79 @@ _CONTENT_POLICY_MARKERS = (
     "SensitiveContent",
 )
 
+# ---------------------------------------------------------------------------
+# 403 自动禁用（默认 2 小时，到期自动恢复）
+# ---------------------------------------------------------------------------
+# 语义：上游 403 分两类，必须区别对待——
+#   ① **不可重试的账号级拒绝**（pricing/套餐 112、账号被封、权限拒绝等）：
+#      继续拿这个号打只会一直 403，还占着轮换名额。这里直接「自动禁用 + 冷却」
+#      2 小时；到期后 refresh_auto_disable() 自动翻回启用，无需人工干预。
+#   ② **排队/资源类 10605**：那是上游当前没资源，不是账号问题——按
+#      retryAfterSeconds 延长冷却即可，**绝不**自动禁用（否则一次排队就把所有
+#      号停 2 小时）。
+#   ③ **请求内容问题**（内容审核、参数非法）：账号是好的，禁用毫无意义。
+AUTO_DISABLE_403_SECS = int(os.environ.get("QD_403_DISABLE_SECS") or 7200)
+
+# **模型级** 403：这个模型对该账号不可用（未开通/要付费），但同账号的其它
+# 模型仍然可用 —— 所以只能冷却这个模型，绝不能把整个账号禁 2 小时。
+# 反例（实测）：所有号打 Qwen3.8-Max 都返回 112+pricingUrl，而打
+# Qwen3.8-Flash 正常；按账号禁用会让整个池子瞬间全黑。
+_403_MODEL_SCOPED_MARKERS = (
+    "pricingurl",           # code 112：该模型需要付费套餐/credits
+    '"code":"112"',
+    '"code": "112"',
+    "model_not_available",
+    "model_disabled",
+)
+
+# 这些标记表示「这个号本身不被允许」而不是「这次请求有问题」
+_403_ACCOUNT_MARKERS = (
+    "account_banned",
+    "account_disabled",
+    "user_banned",
+    "user_disabled",
+    "account_suspended",
+    "permission_error",
+    "forbidden",
+    "not authorized",
+    "unauthorized",
+)
+
+
+def is_queue_403(detail):
+    """10605 / RESOURCE_LIMIT / isQueued：上游排队，不是账号问题。"""
+    text = str(detail or "")
+    low = text.lower()
+    return ("10605" in text or "resource_limit" in low
+            or "isqueued" in low)
+
+
+def should_auto_disable_403(detail):
+    """403 是否应触发「自动禁用 2 小时」。返回 (bool, reason)。
+
+    保守判定：只有明确指向账号/套餐不被允许的 403 才禁用；排队、内容审核、
+    参数错误一律不禁用（它们各自有更合适的处理）。
+    """
+    text = str(detail or "")
+    low = text.lower()
+    if is_queue_403(text):
+        return False, "queue"
+    if any(marker in text for marker in _CONTENT_POLICY_MARKERS):
+        return False, "content_policy"
+    if qoder_accounts.session_dead(text):
+        # 凭证彻底失效：老逻辑是直接停用（不自动恢复），这里交给调用方处理
+        return False, "session_dead"
+    # 模型级 403 先判：付费墙/单模型未开通，只冷却该模型，不禁用账号
+    if any(marker.lower() in low for marker in _403_MODEL_SCOPED_MARKERS):
+        return False, "model_scoped"
+    # 账号级标记先于 client_fault：permission_error 同时在两个名单里，
+    # 但 403 语境下它是「这个号没权限」，不是「这次请求参数错了」。
+    if any(marker.lower() in low for marker in _403_ACCOUNT_MARKERS):
+        return True, "账号被上游拒绝（403）"
+    if any(marker in text for marker in _CLIENT_FAULT_MARKERS):
+        return False, "client_fault"
+    return False, "other"
+
 
 def _is_transient_upstream(code, detail):
     """判断一次上游 HTTP 错误是否属于瞬时故障（可重试）。
@@ -5255,7 +5334,7 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
     elif status_int in (401, 403):
         dead = qoder_accounts.session_dead(detail)
         # 10605 排队冷却为模型级或账号级
-        is_queue = "10605" in detail or "isQueued" in detail
+        is_queue = is_queue_403(detail)
         cd = 300 if dead else (retry_secs if is_queue else 60)
         actual = account.note_error("envelope HTTP %s: %s"
                                     % (status_int, detail[:80]),
@@ -5265,6 +5344,23 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
             "%.0fs (requested %ds, realm_ready=%d) and rotating"
             % (account.uid[:8], status_int, is_queue, float(actual or 0), cd,
                total), level="WARN", tag="chat")
+        # 403 自动禁用（2h，到期自愈）：排队/内容审核/参数问题不禁用
+        disable, why = should_auto_disable_403(detail)
+        if why == "model_scoped" and model and not dead:
+            # 该模型对这个号不可用（未开通/付费墙）：只把这个**模型**停 2 小时，
+            # 账号的其它模型继续可用。到期由 model_cooldowns 自然过期。
+            account.model_cooldowns[model] = time.time() + AUTO_DISABLE_403_SECS
+            log("model '%s' disabled on account %s for %ds (403 %s) - other "
+                "models keep working"
+                % (model, account.uid[:8], AUTO_DISABLE_403_SECS, detail[:60]),
+                level="WARN", tag="chat")
+        if disable and not dead:
+            window = account.auto_disable(
+                AUTO_DISABLE_403_SECS,
+                "envelope 403: %s（%s）" % (why, detail[:120]))
+            log("account %s AUTO-DISABLED for %ds after 403 (%s) - it will be "
+                "re-enabled automatically when the window expires"
+                % (account.uid[:8], window, why), level="ERROR", tag="chat")
         if dead:
             account.enabled = False
             account.save(ACCOUNTS_DIR) if account.path else None
@@ -5627,6 +5723,21 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                 account.note_error("HTTP %s %s" % (exc.code, detail[:80]),
                                    cooldown=300 if dead else 60,
                                    single_account=(total <= 1))
+                disable, why = should_auto_disable_403(detail)
+                if exc.code == 403 and why == "model_scoped" and model and not dead:
+                    account.model_cooldowns[model] = (
+                        time.time() + AUTO_DISABLE_403_SECS)
+                    log("model '%s' disabled on account %s for %ds (403 %s)"
+                        % (model, account.uid[:8], AUTO_DISABLE_403_SECS,
+                           detail[:60]), level="WARN", tag="chat")
+                if exc.code == 403 and disable and not dead:
+                    window = account.auto_disable(
+                        AUTO_DISABLE_403_SECS,
+                        "HTTP 403: %s（%s）" % (why, detail[:120]))
+                    log("account %s AUTO-DISABLED for %ds after HTTP 403 (%s) "
+                        "- automatic re-enable when the window expires"
+                        % (account.uid[:8], window, why),
+                        level="ERROR", tag="chat")
                 if dead:
                     account.enabled = False
                     account.save(ACCOUNTS_DIR) if account.path else None

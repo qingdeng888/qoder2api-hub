@@ -1302,6 +1302,11 @@ class Account(object):
         self.remark = str(data.get("remark") or data.get("note") or "").strip()[:120]
         self.last_error = str(data.get("lastError") or "")
         self.cooldown_until = float(data.get("cooldownUntil") or 0)
+        # 403 自动禁用：到期自动恢复启用（不像手工停用需要人工点回来）。
+        # disabled_until 是唯一真源：> now 表示「自动禁用中」，到期由
+        # _auto_reenable() 翻回 enabled=True 并清空，落盘持久化。
+        self.disabled_until = float(data.get("disabledUntil") or 0)
+        self.disabled_reason = str(data.get("disabledReason") or "")
         # 按模型粒度的限流冷却：上游频控只针对单模型，不能拖垮整个账号。
         self.model_cooldowns = {}
         self.credits = data.get("credits") or None
@@ -1390,6 +1395,8 @@ class Account(object):
             "remark": self.remark,
             "lastError": self.last_error,
             "cooldownUntil": self.cooldown_until,
+            "disabledUntil": self.disabled_until,
+            "disabledReason": self.disabled_reason,
             "credits": self.credits,
             "lastQuotaAnomaly": self.last_quota_anomaly,
             "creditsDegraded": self.credits_degraded,
@@ -1411,6 +1418,9 @@ class Account(object):
             "realm": self.realm,
             "platform": self.platform,
             "enabled": bool(self.enabled),
+            # 403 自动禁用：面板显示「自动禁用 x 分钟」并提示会自动恢复
+            "autoDisabledFor": self.auto_disabled_for(),
+            "autoDisabledReason": self.disabled_reason or "",
             "source": self.source,
             "proxyMode": self.proxy_mode or "",
             "proxyId": self.proxy_id or "",
@@ -1490,6 +1500,7 @@ class Account(object):
 
     # -- 健康与冷却 --------------------------------------------------------
     def ready(self, model=None):
+        self.refresh_auto_disable()
         if not self.enabled or not self.access_token:
             return False
         if self.cooldown_until > time.time():
@@ -1718,6 +1729,58 @@ class Account(object):
         self.balance_until = 0.0
         self.balance_reason = ""
         return True
+
+    # -- 403 自动禁用 / 到期自动恢复 --------------------------------------
+    def auto_disable(self, seconds, reason="", model=None):
+        """因上游 403 自动禁用：写 disabled_until + 冷却 + 落盘。
+
+        与手工「停用」的区别：这个**会自己恢复**——到期后 refresh_auto_disable()
+        把 enabled 翻回 True。返回实际生效的秒数。
+        """
+        try:
+            window = max(1, int(seconds or 0))
+        except (TypeError, ValueError):
+            window = 7200
+        now = time.time()
+        self.enabled = False
+        self.disabled_until = now + window
+        self.disabled_reason = str(reason or "upstream 403")[:200]
+        self.cooldown_until = max(self.cooldown_until, now + window)
+        self.last_error = self.disabled_reason
+        self.model_cooldowns.pop(model, None) if model else None
+        if self.path and os.path.exists(os.path.dirname(self.path)):
+            try:
+                self.save(os.path.dirname(self.path))
+            except Exception:
+                pass
+        return window
+
+    def refresh_auto_disable(self):
+        """到期自动恢复启用；返回 True 表示本次刚恢复（调用方据此落盘/记日志）。"""
+        if not self.disabled_until:
+            return False
+        if self.disabled_until > time.time():
+            return False
+        self.disabled_until = 0.0
+        self.disabled_reason = ""
+        self.enabled = True
+        # auto_disable 会把 cooldown_until 同步推到同一截止点；恢复时必须把这条
+        # 冷却一起清掉，否则账号会「已启用但仍被冷却挡着」（ready() 返回 False，
+        # 轮换永远选不到它）。自动禁用的窗口本身就是它的冷却来源，这里整体清空；
+        # 上游再 403 会重新写一条新的冷却/禁用。
+        self.cooldown_until = 0.0
+        self.last_error = ""
+        if self.path and os.path.exists(os.path.dirname(self.path)):
+            try:
+                self.save(os.path.dirname(self.path))
+            except Exception:
+                pass
+        return True
+
+    def auto_disabled_for(self):
+        """自动禁用剩余秒数（0 = 未处于自动禁用）。"""
+        return max(0, int(self.disabled_until - time.time())) \
+            if self.disabled_until else 0
 
     def note_error(self, message, cooldown=60, single_account=False, model=None, until=None):
         """记录一次错误并设置冷却；**返回实际生效的冷却秒数**（#29）。
@@ -3228,6 +3291,11 @@ class AccountPool(object):
         with self._lock:
             accs = self.accounts if (not realm or realm == "all") else \
                 [a for a in self.accounts if a.realm == realm]
+            # 打开面板就是一次自然的重启恢复点：到期的 403 自动禁用在这里翻回来
+            for account in accs:
+                if account.refresh_auto_disable():
+                    self.log("account %s auto re-enabled (403 cooldown expired)"
+                             % account.uid[:8])
             return [a.public() for a in accs]
 
     def get(self, uid):
@@ -3549,6 +3617,10 @@ class AccountPool(object):
             return None
         account.enabled = bool(enabled)
         if enabled:
+            # 手工启用 = 覆盖 403 自动禁用：清掉截止时间，否则下一次 ready()
+            # 会把它当成「未到期」继续拦着（用户点了启用却还是不可用）。
+            account.disabled_until = 0.0
+            account.disabled_reason = ""
             account.clear_error()
         account.save(self.dir)
         return account.public()
