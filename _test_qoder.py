@@ -2958,10 +2958,12 @@ check("开关：auto + CN + GLM（上游 key gm5x）-> 结构化",
       P.structured_tool_history_enabled(model="glm-5.3-flash",
                                         model_key="gm53flash",
                                         realm="cn", messages=_SMSGS32) is True)
-check("开关：auto + CN + DeepSeek -> 文本化（未验证 provider 默认不启用）",
+# issue #49 后续：DeepSeek 已由报告者在真实长会话端到端验证（1283 次调用 0 降级），
+# 并入白名单——auto + CN + DeepSeek 现在应走结构化直传。
+check("开关：auto + CN + DeepSeek -> 结构化（#49 后续：端到端验证通过）",
       P.structured_tool_history_enabled(model="deepseek-flash",
                                         model_key="deepseek-flash",
-                                        realm="cn", messages=_SMSGS32) is False)
+                                        realm="cn", messages=_SMSGS32) is True)
 check("开关：auto + INTL -> 文本化（INTL legacy 未实测）",
       P.structured_tool_history_enabled(model="qwen3.8-flash",
                                         model_key="qwen3.8-flash",
@@ -3598,9 +3600,9 @@ finally:
     else:
         os.environ["QD_STRUCTURED_TOOL_HISTORY"] = _orig_env32
 
-check("开关三态·auto：默认只放行 CN+白名单（Qwen/GLM/gm4 真；DeepSeek/Kimi/INTL 假）",
+check("开关三态·auto：默认放行 CN+白名单（Qwen/GLM/gm4/DeepSeek 真；Kimi/INTL 假）",
       _auto_cn_qwen is True and _auto_cn_glm is True and _auto_cn_glm2 is True
-      and _auto_cn_ds is False and _auto_cn_kimi is False
+      and _auto_cn_ds is True and _auto_cn_kimi is False
       and _auto_intl_qwen is False,
       (_auto_cn_qwen, _auto_cn_glm, _auto_cn_ds, _auto_cn_kimi, _auto_intl_qwen))
 check("开关三态·on/off：on 强制放行（含 DeepSeek/INTL），off 一律关闭",

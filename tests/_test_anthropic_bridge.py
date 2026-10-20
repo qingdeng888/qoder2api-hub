@@ -60,18 +60,40 @@ _s2 = AN.system_prompt_of({"system": [{"type": "text", "text": "top-str"}],
 _s3 = AN.system_prompt_of({"messages": [
     {"role": "system", "content": "mid-system"},
     {"role": "user", "content": "u"}]})
-check("顶层字符串 / 顶层数组 / messages 内 system 三种形态都能取到",
-      _s1 == "top-str" and _s2 == "top-str" and _s3 == "mid-system")
+check("顶层字符串 / 顶层数组两种形态都能取到",
+      _s1 == "top-str" and _s2 == "top-str")
+# issue #55：messages 内 system **默认不再上提**（它会污染缓存前缀）——
+# 默认 inline：顶层 system 保持稳定，动态内容就地降级为 user。
+_os_dir = AN.system_prompt_of({"messages": [
+    {"role": "system", "content": "mid-system"},
+    {"role": "user", "content": "u"}]})
+check("#55 默认（inline）：messages 内 system 不进入顶层 system",
+      _os_dir == "", repr(_os_dir))
 _merged = AN.system_prompt_of({"system": "s-a", "messages": [
     {"role": "system", "content": "s-b"},
     {"role": "user", "content": "u"}]})
-check("三形态**合并**（含 messages 内的 system，不丢弃）",
-      _merged == "s-a\n\ns-b", _merged)
+check("#55 默认（inline）：顶层 system 保持原样（前缀稳定）",
+      _merged == "s-a", _merged)
+# merge 模式（QD_ANTHROPIC_MSG_SYSTEM=merge）保留旧的合并语义
+import os as _os55
+_old55 = _os55.environ.get("QD_ANTHROPIC_MSG_SYSTEM")
+_os55.environ["QD_ANTHROPIC_MSG_SYSTEM"] = "merge"
+try:
+    _merged2 = AN.system_prompt_of({"system": "s-a", "messages": [
+        {"role": "system", "content": "s-b"},
+        {"role": "user", "content": "u"}]})
+finally:
+    if _old55 is None:
+        _os55.environ.pop("QD_ANTHROPIC_MSG_SYSTEM", None)
+    else:
+        _os55.environ["QD_ANTHROPIC_MSG_SYSTEM"] = _old55
+check("#55 merge 模式仍可合并（兼容开关）", _merged2 == "s-a\n\ns-b", _merged2)
 _chat = AN.messages_to_chat({"messages": [
     {"role": "system", "content": "s-b"}, {"role": "user", "content": "u"}]})
-check("合并后的 system 落在 messages[0]（且只落一条）",
-      _chat["messages"][0] == {"role": "system", "content": "s-b"}
-      and len([m for m in _chat["messages"] if m["role"] == "system"]) == 1)
+check("#55 默认：messages 内 system 降级为 user（内容不丢、位置不变）",
+      _chat["messages"][0] == {"role": "user", "content": "s-b"}
+      and _chat["messages"][1] == {"role": "user", "content": "u"},
+      _chat["messages"])
 
 print()
 print("[2] 入站映射（§3.1 的 14 行字段表）")

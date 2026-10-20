@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.5.4-2496ED?style=flat-square" alt="Version 1.3.7">
+  <img src="https://img.shields.io/badge/Release-v1.5.5-2496ED?style=flat-square" alt="Version 1.3.7">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -111,7 +111,7 @@ ghcr.io/qingdeng888/qoder2api-hub:latest
 ghcr.io/qingdeng888/qoder2api-hub:sha-<短提交>
 ```
 
-打 `v*` tag 时还会追加 `1.5.4`、`1.5` 等语义化版本标签。`docker-compose.yml` 默认已指向该镜像：
+打 `v*` tag 时还会追加 `1.5.5`、`1.5` 等语义化版本标签。`docker-compose.yml` 默认已指向该镜像：
 
 ```bash
 # 1. 拉取并启动
@@ -153,7 +153,7 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 
 > **镜像与构建入口**：[**GHCR 包页面**](https://github.com/qingdeng888/qoder2api-hub/pkgs/container/qoder2api-hub)（tag、架构、拉取命令）· [**Releases**](https://github.com/qingdeng888/qoder2api-hub/releases) · [**Build Docker image**](https://github.com/qingdeng888/qoder2api-hub/actions/workflows/docker-publish.yml)（每次 push main 自动构建）。
 >
-> 可用 tag：**`latest`**（main 最新）· **`sha-<短提交>`**（钉死某次构建）· **`1.5.4` / `1.5`**（v* tag 构建）。镜像为 **linux/amd64 + linux/arm64** 双架构。
+> 可用 tag：**`latest`**（main 最新）· **`sha-<短提交>`**（钉死某次构建）· **`1.5.5` / `1.5`**（v* tag 构建）。镜像为 **linux/amd64 + linux/arm64** 双架构。
 
 ### 6. 宿主机原生运行（调试推荐）
 
@@ -579,6 +579,35 @@ python _verify_models.py --base http://127.0.0.1:8790
 
 - **GitHub Actions 自动构建**：每次 push `main` 构建并推送 `ghcr.io/qingdeng888/qoder2api-hub:latest`（含 `sha-<短提交>`；打 `v*` tag 追加语义化版本），`docker-compose.yml` 默认使用该镜像。
 - **宿主机原生部署**：`run-local.sh` + `.env.local` + systemd unit，改代码后 `systemctl restart` 即生效，适合调试。
+
+### v1.5.5-fork
+
+本 fork 在上游 v1.5.5 基础上继续保留并叠加以下能力（完整清单见 v1.5.4-fork / v1.5.4-fork.1 / v1.5.4-fork.2）：
+
+- **出站代理池**（HTTP/HTTPS/SOCKS4/4a/5/5h、轮换/粘性/随机/单代理、健康检查、指数冷却、批量操作）；
+- **账号级出口绑定**（默认 / auto / bind / rotate / direct，随账号 JSON 持久化）；
+- **API 连通性测试（Playground）** + **可自定义「检测模型」**（面板设置，默认 `Qwen3.8-Flash`，`probe_model` 落盘）；
+- **403 冷却只认检测模型**：只有检测模型的 403 才冷却/自动禁用账号（2 小时自愈），付费墙 112 永不禁用；
+- **账号备注**（本地字段，导入导出保留）；
+- **GitHub Actions 自动构建** `ghcr.io/qingdeng888/qoder2api-hub`（push main 即构建，tag 追加语义化版本）；
+- **宿主机原生部署**（`run-local.sh` + `.env.local` + systemd）。
+
+本次合并带入的上游改动：**Anthropic system 前缀稳定性（#55）**、**智能体一键配置读错 Key 字段（#53 / PR #54）**、**DeepSeek 进入结构化工具历史白名单（#49 后续）**。
+
+### v1.5.5
+
+**🐛 问题修复**
+
+- **Anthropic 入口把动态 system 抬进缓存前缀，命中率 92% → 14.7%**（#55）：`system_prompt_of` 会把 `messages` 里的 system 合并进最前面的 system，而客户端（Claude Desktop/Code）恰恰把**每轮都变**的内容放在那里（当前时间、工具清单、skills、context 用量）。合并后前缀逐轮不同，上游缓存从第 0 字节就失配。
+  现在默认 **inline**：`messages` 内 system **就地降级成一条 user**（内容不丢、位置不变），顶层 system 保持字节稳定；旧行为保留为 `QD_ANTHROPIC_MSG_SYSTEM=merge`，另有 `drop`。
+- **指纹看不出来源**（#55）：`usage.jsonl` 新增 `sys_src`（`top` / `top+inline` / `top+msg` / `none`）与 `n_msg_system`，下次这类问题不必翻代码。
+- **智能体一键配置根本发不出请求**（#53，PR #54 by WCX0221）：`/settings` 只回掩码、从不回明文 `key`，而下拉用 `k.key` 做 option value → 所有 option 值都是空串 → 点「一键配置」只弹「请先选择 API Key」。现在 option value 用 key **id**，点击时经 `/settings/reveal?id=` 取一次明文（与设置页复制 Key 同一路径）。
+
+**⚙️ 行为变更**
+
+- **DeepSeek 进入结构化工具历史白名单**（#49 后续）：报告者在真实长会话（Anthropic 入口、1,283 次工具调用）验证 **0 降级**，同环境开启前基线 0.30%。结构化直传后模型看不到 `LEAK_MARKER` 文本格式，从根上消除复述。`_tool_ids_ok` 守卫仍在（id 不齐备自动回退文本化），INTL 仍不在 auto 范围。
+
+**验证**：全量 **40 suites / 1392 checks / 0 failed**（新增 `_test_issue55_system_prefix.py` 17 条 + PR 自带 `_test_agents_panel.js` 20 条）。
 
 ### v1.5.4
 

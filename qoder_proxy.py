@@ -57,7 +57,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.5.4"
+VERSION = "1.5.5"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -2198,7 +2198,19 @@ def derive_affinity_key(messages):
         return None
 
 
-def prompt_fingerprint(messages):
+def _anthropic_sys_src(payload):
+    """Anthropic 入口的 system 来源标记（issue #55，写进 usage 行）。"""
+    has_top = bool(str((payload or {}).get("system") or "").strip())
+    n_msg = qoder_anthropic.count_msg_system(payload)
+    mode = qoder_anthropic.msg_system_mode()
+    if mode == "merge" and n_msg:
+        return "top+msg" if has_top else "msg"
+    if mode == "inline" and n_msg:
+        return "top+inline" if has_top else "inline"
+    return "top" if has_top else "none"
+
+
+def prompt_fingerprint(messages, sys_src=None, n_msg_system=None):
     """Privacy-safe fingerprint of the outgoing prompt.
 
     Cache hits need a byte-identical prefix, so these hashes answer "is my
@@ -2211,6 +2223,12 @@ def prompt_fingerprint(messages):
             return hashlib.sha256(blob).hexdigest()[:12]
         msgs = messages or []
         out = {"msgs_sha": h(msgs), "n_msgs": len(msgs)}
+        # issue #55：把 system 的来源与条数写进指纹——「顶层 system 稳定、
+        # messages 内 system 每轮都在变」这类问题不必再翻代码就能定位。
+        if sys_src is not None:
+            out["sys_src"] = str(sys_src)
+        if n_msg_system is not None:
+            out["n_msg_system"] = int(n_msg_system)
         if msgs:
             out["system_sha"] = h(msgs[0]) if msgs[0].get("role") == "system" else ""
             out["prefix_sha"] = h(msgs[:-1]) if len(msgs) > 1 else ""
@@ -4605,7 +4623,11 @@ def _current_turn_start(messages):
 # 接受结构化历史并被正确消费（含 3 轮链、结构化+旧文本信封混合、并行调用、
 # id 不匹配）；DeepSeek / Kimi 在 assistant.content=null 时被拒，**content=""
 # 即通过**。因此本实现恒用空字符串，绝不发 null。
-STRUCTURED_TOOL_HISTORY_WHITELIST = ("qwen", "glm", "gm4", "gm5")
+# issue #49 后续：DeepSeek 由报告者在真实长会话上端到端验证通过（v1.5.4，
+# Anthropic 入口，1,283 次工具调用 0 降级；同环境开启前基线 0.30%）。
+# 结构化直传后模型看不到 LEAK_MARKER 文本格式，也就无从复述——这是治本项。
+# _tool_ids_ok 守卫仍在：客户端 id 不齐备时自动回退文本化，不会踩坑。
+STRUCTURED_TOOL_HISTORY_WHITELIST = ("qwen", "glm", "gm4", "gm5", "deepseek")
 _STRUCTURED_LOG_ONCE = {"done": False}
 
 
@@ -8884,7 +8906,11 @@ class Handler(BaseHTTPRequestHandler):
         model = chat_req.get("model") or payload.get("model") or "auto"
         want_stream = bool(payload.get("stream"))
         session_key = extract_session_key(self.headers, chat_req)
-        fp = prompt_fingerprint(chat_req.get("messages"))
+        # issue #55：带上 system 来源与 messages 内 system 条数（缓存问题可自证）
+        fp = prompt_fingerprint(
+            chat_req.get("messages"),
+            sys_src=_anthropic_sys_src(payload),
+            n_msg_system=qoder_anthropic.count_msg_system(payload))
         t_start = time.time()
         # ---- 形态决策单点：在这里算唯一一次，随 chat_req 下传 ----
         chat_req["_qd_structured"] = structured_tool_history_enabled(

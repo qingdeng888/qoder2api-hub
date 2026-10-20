@@ -5197,6 +5197,11 @@ function switchMainTab(tab){
 
 /* ---- 智能体配置页 ---- */
 let AGENT_OVERVIEW = null;
+// /settings 只回**掩码**（k.masked），从不回明文 Key；下拉的 value 必须是 key id，
+// 明文只在点击「一键配置」时经 /settings/reveal 显式取一次（与设置页复制 Key 同一条路）。
+// 注：v1.4.0 起这里错读 k.key —— 该字段不存在，所有 option 的 value 都是空串，
+// 于是选完 Key 点按钮只会弹「请先选择 API Key」，请求永远发不出去。
+let AGENT_KEYS = {};
 
 async function loadAgentsPage(showToast){
   try{
@@ -5205,13 +5210,19 @@ async function loadAgentsPage(showToast){
     // 网关地址：面板自己的 origin（客户端与面板同机时即网关地址）
     const base = window.location.origin;
     document.getElementById('agentBaseURL').textContent = base;
-    // Key 下拉：设置页的 api_keys（带 realm 绑定名）
+    // Key 下拉：value 用 id（明文不随页面下发），选项文案带掩码便于辨认
     const keySel = document.getElementById('agentApiKeySelect');
     const keys = (settings.api_keys || []).filter(k => k.enabled);
+    AGENT_KEYS = {};
+    keys.forEach(k => { AGENT_KEYS[String(k.id)] = k; });
     const cur = keySel.value;
     keySel.innerHTML = '<option value="">选择 API Key…</option>'
-      + keys.map(k => '<option value="' + esc(k.key) + '">' + esc((k.name || 'Key') + (k.realm ? ' · ' + (k.realm === 'cn' ? '国内版' : '国际版') : ' · 跟随网关')) + '</option>').join('');
-    if(cur) keySel.value = cur;
+      + keys.map(k => '<option value="' + esc(k.id) + '">'
+          + esc((k.name || 'Key')
+                + (k.masked ? ' · ' + k.masked : '')
+                + (k.realm ? ' · ' + (k.realm === 'cn' ? '国内版' : '国际版') : ' · 跟随网关'))
+          + '</option>').join('');
+    if(cur && AGENT_KEYS[cur]) keySel.value = cur;
     // 模型下拉：网关清单
     const modelSel = document.getElementById('agentModelSelect');
     const curM = modelSel.value;
@@ -5232,7 +5243,10 @@ async function loadAgentsPage(showToast){
 }
 
 function onAgentKeyChange(v){
-  document.getElementById('agentKeySel').textContent = v ? '已选择' : '未选择';
+  const k = AGENT_KEYS[v];
+  document.getElementById('agentKeySel').textContent = k
+    ? ((k.name || 'Key') + (k.masked ? ' · ' + k.masked : ''))
+    : '未选择';
 }
 function onAgentModelChange(v){
   document.getElementById('agentModelSel').textContent = v || '跟随客户端';
@@ -5267,11 +5281,16 @@ function renderAgentClients(){
 
 async function applyAgentClient(clientId, btn){
   const keySel = document.getElementById('agentApiKeySelect');
-  const apiKey = keySel.value;
-  if(!apiKey){ toast('请先在上方选择一个 API Key', 'warn'); return; }
+  const keyId = keySel.value;
+  if(!keyId){ toast('请先在上方选择一个 API Key', 'warn'); return; }
   const model = document.getElementById('agentModelSelect').value || '';
   if(btn){ btn.disabled = true; btn.textContent = '配置中...'; }
   try{
+    // 明文 Key 不驻留在页面数据里：apply 前按 id 显式取一次。面板会话 +
+    // loopback 是写入的前提；默认密码时服务端会 403 并给出可读原因。
+    const revealed = await getJSON('/settings/reveal?id=' + encodeURIComponent(keyId));
+    const apiKey = String((revealed && revealed.key) || '');
+    if(!apiKey) throw new Error('该 API Key 没有明文可写入，请重新生成后再试');
     const r = await postJSON('/agents/apply', {
       client: clientId,
       base_url: window.location.origin,
