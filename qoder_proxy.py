@@ -47,19 +47,22 @@ import random
 import uuid
 
 import qoder_accounts
+import qoder_activity
 import qoder_agents
 import qoder_anthropic
 import qoder_catalog
+import qoder_pricing
 import qoder_proxypool
 import qoder_settings
 import qoder_sign
 import qoder_updater
+import qoder_webtools
 from qoder_sign import qoder_encode, SESSIONS
-from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
+from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.6.1"
+VERSION = "1.6.4"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -527,6 +530,7 @@ def _empty_stats():
     return {"requests": 0, "errors": 0, "prompt_tokens": 0,
             "completion_tokens": 0, "reasoning_tokens": 0, "cached_tokens": 0,
             "total_tokens": 0, "credit": 0.0, "original_credits": 0.0,
+            "cost_usd": 0.0, "unpriced": 0,
             "started": time.time(),
             "by_model": {},
             "ttft_ms_sum": 0, "ttft_samples": 0,
@@ -972,6 +976,18 @@ def usage_snapshot(realm=None, ttl=10):
     return data
 
 
+_PRICING_CACHE = {"at": 0.0, "data": {}}
+
+
+def _PRICING_OVERRIDES():
+    """usage/pricing-overrides.json，30 秒缓存（改完不用重启）。"""
+    now = time.time()
+    if now - _PRICING_CACHE["at"] > 30:
+        _PRICING_CACHE["data"] = qoder_pricing.load_overrides(USAGE_DIR)
+        _PRICING_CACHE["at"] = now
+    return _PRICING_CACHE["data"]
+
+
 def _usage_snapshot_uncached(realm=None):
     r = realm or CURRENT_REALM
     rep = POOL.representative(realm=r) if POOL else current_account()
@@ -1004,6 +1020,16 @@ def _usage_snapshot_uncached(realm=None):
                     for k in USAGE_FIELDS:
                         if k in row:
                             per[k] += (row[k] or 0)
+                    # 费用估算（参考 OpenRouter 价，读时折算；未知模型不计）
+                    _c = qoder_pricing.cost_of(
+                        row.get("model"), row.get("prompt_tokens") or 0,
+                        row.get("cached_tokens") or 0,
+                        row.get("completion_tokens") or 0, _PRICING_OVERRIDES())
+                    if _c is not None:
+                        snap["cost_usd"] = snap.get("cost_usd", 0.0) + _c
+                        per["cost_usd"] = per.get("cost_usd", 0.0) + _c
+                    else:
+                        snap["unpriced"] = snap.get("unpriced", 0) + 1
                     acct_id = row.get("account")
                     if acct_id:
                         per.setdefault("accounts", {})
@@ -2165,6 +2191,9 @@ def runtime_settings_view():
             "hours": round(AUTO_DISABLE_403_SECS / 3600.0, 2),
             "env": "QD_403_DISABLE_SECS",
         },
+        # 本地 web 工具开关（默认关）：这是唯一由模型驱动出网的能力
+        "web_tools": web_tools_enabled(),
+        "web_tools_rounds": WEB_TOOLS_MAX_ROUNDS,
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": qoder_settings.settings_path(ACCOUNTS_DIR),
@@ -2568,7 +2597,6 @@ def read_dynamic_models(realm=None):
             sess = SESSIONS.get(account)
             headers = sess.headers(sign_body, raw_url, model_key="", sse=False,
                                    accept="application/json")
-            headers["User-Agent"] = CLIENT_UA
             url = validate_public_http_url(raw_url)
             req = urllib.request.Request(url, data=sign_body.encode("utf-8"),
                                          method="GET", headers=headers)
@@ -6309,6 +6337,82 @@ class _TeamLeaseResp(object):
             _team_release(self._account, self._lease)
 
 
+# ---------------------------------------------------------------------------
+# 本地 web 工具（web_search / web_fetch 由网关本地执行）
+# ---------------------------------------------------------------------------
+WEB_TOOLS_MAX_ROUNDS = int(os.environ.get("QD_WEB_TOOLS_ROUNDS") or 3)
+
+
+def web_tools_enabled():
+    """是否开启本地 web 工具：QD_WEB_TOOLS 优先，其次面板持久化开关。"""
+    raw = str(os.environ.get("QD_WEB_TOOLS") or "").strip().lower()
+    if raw in ("1", "on", "true", "yes", "enable", "enabled"):
+        return True
+    if raw in ("0", "off", "false", "no", "disable", "disabled"):
+        return False
+    try:
+        return qoder_settings.web_tools_enabled(ACCOUNTS_DIR)
+    except Exception:
+        return False
+
+
+def builtin_web_tool_names(tools):
+    """客户端声明的内置 web 工具名集合（web_search / web_fetch）。"""
+    names = set()
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        kind = str(tool.get("type") or "")
+        if kind in qoder_webtools.SEARCH_DECL_TYPES:
+            names.add(qoder_webtools.WEB_SEARCH_NAME)
+        elif kind in qoder_webtools.FETCH_DECL_TYPES:
+            names.add(qoder_webtools.WEB_FETCH_NAME)
+    return names
+
+
+def rewrite_web_tools(tools, names):
+    """把内置声明换成网关自己的同名 function 声明（其它工具原样保留）。"""
+    out = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        kind = str(tool.get("type") or "")
+        if kind in qoder_webtools.SEARCH_DECL_TYPES \
+                or kind in qoder_webtools.FETCH_DECL_TYPES:
+            continue
+        out.append(tool)
+    for decl in qoder_webtools.tool_declarations():
+        if decl["function"]["name"] in names:
+            out.append(decl)
+    return out
+
+
+def _chat_chunks(obj, model):
+    """把聚合好的 chat 对象摊成 SSE 分片（web 工具路径用：内容是整段回放）。"""
+    cid = (obj or {}).get("id") or "chatcmpl-web"
+    created = int((obj or {}).get("created") or time.time())
+    mdl = (obj or {}).get("model") or model or ""
+    text = (((obj or {}).get("choices") or [{}])[0].get("message") or {}).get(
+        "content") or ""
+    base = {"id": cid, "object": "chat.completion.chunk",
+            "created": created, "model": mdl}
+    yield dict(base, choices=[{"index": 0, "delta": {"role": "assistant"},
+                               "finish_reason": None}])
+    if text:
+        yield dict(base, choices=[{"index": 0, "delta": {"content": text},
+                                   "finish_reason": None}])
+    tail = dict(base, choices=[{"index": 0, "delta": {},
+                                "finish_reason": "stop"}])
+    if (obj or {}).get("usage"):
+        tail["usage"] = (obj or {}).get("usage")
+    yield tail
+
+
+def _chat_chunks_iter(obj, model):
+    return [("data: " + json.dumps(c, ensure_ascii=False) + "\n\n").encode()
+            for c in _chat_chunks(obj, model)]
+
+
 def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                   allow_queue_wait=True):
     """构造 COSY 签名请求并打开上游 SSE。返回 (resp, account, encoded)。
@@ -6434,7 +6538,6 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                 sess = SESSIONS.get(account)
                 headers = sess.headers(encoded, raw_url, model_key=model_key,
                                        sse=True)
-                headers["User-Agent"] = CLIENT_UA
                 chat_url = validate_public_http_url(raw_url)
                 req = urllib.request.Request(chat_url,
                                              data=encoded.encode("utf-8"),
@@ -8770,6 +8873,145 @@ class Handler(BaseHTTPRequestHandler):
             req_realm = query.get("realm", [None])[0] \
                 or self.headers.get("X-Realm") or CURRENT_REALM
             return self._json(200, usage_snapshot(realm=req_realm))
+
+        if path == "/pricing":
+            # 参考价目表（跟进 wb 的「OpenRouter 价估算」）：只读，不发网络请求
+            if not self._authorized():
+                return
+            _ov = _PRICING_OVERRIDES()
+            _seen = set()
+            try:
+                with open(USAGE_LOG, encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            _seen.add(json.loads(line).get("model") or "")
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+            _unpriced = sorted(m for m in _seen if m
+                               and qoder_pricing.price_for(m, _ov) is None)
+            return self._json(200, {
+                "ok": True,
+                "table": qoder_pricing.table(USAGE_DIR),
+                "unpriced": _unpriced,
+                "note": "参考 OpenRouter 公布价折算，仅用于估算，不能用于结算；"
+                        "可在 usage/pricing-overrides.json 覆盖单价",
+            })
+        if path == "/accounts/credits/grants":
+            # 积分获取历史（跟进 wb）：只读内存里的积分快照，不发上游请求
+            if not self._authorized():
+                return
+            rows = []
+            snap_at = None
+            for acc in (POOL.accounts if POOL else []):
+                cred = getattr(acc, "credits", None)
+                if not isinstance(cred, dict):
+                    continue
+                at = cred.get("updated_at")
+                if at and (snap_at is None or at > snap_at):
+                    snap_at = at
+                for pkg in cred.get("packages") or []:
+                    if not isinstance(pkg, dict):
+                        continue
+                    rows.append({
+                        "account": (getattr(acc, "nickname", "") or
+                                    (getattr(acc, "uid", "") or "")[:8]),
+                        "realm": getattr(acc, "realm", "") or "",
+                        "name": pkg.get("name") or "",
+                        "size": pkg.get("size"),
+                        "remain": pkg.get("remain"),
+                        "used": pkg.get("used"),
+                        "expires_at": pkg.get("expires_at"),
+                        "updated_at": at,
+                    })
+            rows.sort(key=lambda r: (r.get("updated_at") or 0), reverse=True)
+            total_size = sum(int(r["size"] or 0) for r in rows)
+            total_remain = sum(int(r["remain"] or 0) for r in rows)
+            return self._json(200, {
+                "ok": True, "rows": rows,
+                "summary": {"count": len(rows), "size": total_size,
+                            "remain": total_remain,
+                            "snapshot_at": snap_at},
+                "note": "来自最近一次积分刷新/签到的快照，不是实时上游数据",
+            })
+        if path == "/accounts/activity":
+            # 签到 / 领取动作流水（跟进 wb_activity）：只读本地 jsonl，不发上游请求
+            if not self._authorized():
+                return
+            try:
+                limit = int((query.get("limit") or ["200"])[0])
+            except Exception:
+                limit = 200
+            rows = qoder_activity.recent(USAGE_DIR, limit=limit)
+            ok_count = sum(1 for r in rows if r.get("ok"))
+            earned = sum(int(r.get("amount") or 0) for r in rows
+                         if r.get("kind") == "checkin" and r.get("ok"))
+            return self._json(200, {
+                "ok": True, "rows": rows,
+                "summary": {"count": len(rows), "ok": ok_count,
+                            "failed": len(rows) - ok_count,
+                            "earned_credits": earned},
+                "note": "本机动作流水（签到/领取），30 天保留，不代表上游发放明细",
+            })
+        if path == "/usage/remaining":
+            # 剩余用量估算（跟进 wb）：按近 24h 实际消耗速率折算可用天数
+            if not self._authorized():
+                return
+            now = time.time()
+            used = {}
+            try:
+                with open(USAGE_LOG, encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except Exception:
+                            continue
+                        ts = row.get("ts") or row.get("time") or 0
+                        try:
+                            ts = float(ts)
+                        except Exception:
+                            continue
+                        if now - ts > 86400:
+                            continue
+                        if row.get("error"):
+                            continue
+                        uid = row.get("account") or ""
+                        slot = used.setdefault(uid[:8], {"credit": 0.0,
+                                                         "tokens": 0})
+                        slot["credit"] += float(row.get("credit") or 0)
+                        slot["tokens"] += int(row.get("total_tokens") or 0)
+            except Exception:
+                pass
+            out = []
+            for acc in (POOL.accounts if POOL else []):
+                cred = getattr(acc, "credits", None) or {}
+                remain = qoder_accounts.effective_remain(cred)
+                key = (getattr(acc, "uid", "") or "")[:8]
+                day = used.get(key) or {"credit": 0.0, "tokens": 0}
+                days = None
+                if isinstance(remain, (int, float)) and day["credit"] > 0:
+                    days = round(float(remain) / day["credit"], 1)
+                out.append({
+                    "account": getattr(acc, "nickname", "") or key,
+                    "uid": key,
+                    "realm": getattr(acc, "realm", "") or "",
+                    "remain": remain,
+                    "used_24h_credit": round(day["credit"], 2),
+                    "used_24h_tokens": day["tokens"],
+                    "days_left": days,
+                    "unlimited": qoder_accounts.shared_unlimited(cred),
+                })
+            out.sort(key=lambda r: (r["days_left"] is None, r["days_left"] or 0))
+            return self._json(200, {"ok": True, "rows": out,
+                                    "window_hours": 24,
+                                    "note": "按近 24h 消耗线性外推，仅供参考"})
         if path == "/usage/recent":
             if not self._authorized():
                 return
@@ -9514,6 +9756,12 @@ class Handler(BaseHTTPRequestHandler):
                                                   only_daily=True)
                 finally:
                     last_at = time.time()
+                qoder_activity.record(
+                    USAGE_DIR, "checkin", bool(res.get("ok")),
+                    uid=account.uid, nickname=account.nickname,
+                    realm=getattr(account, "realm", "") or "",
+                    detail=(res.get("msg") or res.get("reason") or ""),
+                    amount=res.get("earned_credit") or 0)
                 results.append({
                     "uid": account.uid,
                     "nickname": account.nickname,
@@ -9787,7 +10035,7 @@ class Handler(BaseHTTPRequestHandler):
         ok, problem = qoder_anthropic.validate_request(payload)
         if not ok:
             return self._error(400, problem, "invalid_request_error")
-        req_realm = self._request_realm() or CURRENT_REALM
+        req_realm = self._request_realm()
         model_hint = payload.get("model") or "auto"
         model_key = qoder_catalog.resolve_upstream_key(model_hint, realm=req_realm)
         # 传 supported 档位表，否则 effort_from_anthropic 会静默丢弃思考档位。
@@ -9938,6 +10186,88 @@ class Handler(BaseHTTPRequestHandler):
                          realm_reason=usage_ctx.get("realm_reason", ""))
             return self._json(200, result)
 
+    def _handle_web_tools(self, path, payload, names):
+        """本地代跑 web_search / web_fetch：模型要搜就由网关去搜，再把结果回灌。
+
+        只在客户端声明了内置 web 工具（type=web_search / web_fetch）且开关打开时
+        走这里；普通 function 工具照常走原来的透传路径。
+        """
+        is_responses = path.endswith("/responses")
+        want_stream = bool(payload.get("stream"))
+        try:
+            chat_req = (responses_to_chat(payload) if is_responses
+                        else dict(payload))
+        except Exception as exc:
+            return self._error(400, "invalid request: %s" % exc,
+                               "invalid_request_error")
+        chat_req = dict(chat_req)
+        chat_req["tools"] = rewrite_web_tools(chat_req.get("tools") or [], names)
+        chat_req["stream"] = False
+        model = str(chat_req.get("model") or "")
+        messages = list(chat_req.get("messages") or [])
+        realm = self._request_realm()
+        usage_ctx = {}
+        obj = None
+        rounds = 0
+        for _ in range(max(1, WEB_TOOLS_MAX_ROUNDS)):
+            req = dict(chat_req, messages=messages)
+            try:
+                resp, account, _ = open_upstream(
+                    req, target_realm=realm, usage_ctx=usage_ctx)
+            except RateLimited as exc:
+                return self._rate_limited(exc)
+            except urllib.error.HTTPError as exc:
+                detail = getattr(exc, "qoder_detail", "") or ""
+                msg, etype = friendly_upstream_error(exc.code, detail)
+                return self._error(exc.code, msg, etype)
+            except Exception as exc:
+                return self._error(502, str(exc)[:200], "upstream_error")
+            with resp:
+                obj = aggregate_stream(resp, model,
+                                       holder={"usage": None},
+                                       allowed_names=names)
+            msg = ((obj.get("choices") or [{}])[0].get("message") or {})
+            calls = [c for c in (msg.get("tool_calls") or [])
+                     if (c.get("function") or {}).get("name") in names]
+            if not calls:
+                break
+            rounds += 1
+            log("web tools: round %d, %d call(s) -> local execution"
+                % (rounds, len(calls)), tag="webtools")
+            messages.append({"role": "assistant",
+                             "content": msg.get("content") or "",
+                             "tool_calls": msg.get("tool_calls") or []})
+            for call in calls:
+                fn = call.get("function") or {}
+                try:
+                    result = qoder_webtools.run_tool(fn.get("name"),
+                                                     fn.get("arguments"))
+                except Exception as exc:
+                    result = json.dumps({"error": str(exc)[:120]},
+                                        ensure_ascii=False)
+                messages.append({"role": "tool",
+                                 "tool_call_id": call.get("id") or "",
+                                 "content": result})
+        self.realm_used = usage_ctx.get("realm") or (realm or "")
+        obj = obj or {"choices": [{"index": 0, "message": {"role": "assistant",
+                                   "content": ""}, "finish_reason": "stop"}]}
+        if is_responses:
+            if not want_stream:
+                return self._json(200, chat_to_response(obj, model))
+            self._sse_begin()
+            for frame in stream_responses_events(
+                    _chat_chunks_iter(obj, model), model,
+                    {"usage": obj.get("usage")}):
+                self._sse_write(clean_responses_frame(frame))
+            return
+        if not want_stream:
+            return self._json(200, obj)
+        self._sse_begin()
+        for chunk in _chat_chunks(obj, model):
+            self._sse_write("data: " + json.dumps(chunk, ensure_ascii=False)
+                            + "\n\n")
+        self._sse_write("data: [DONE]\n\n")
+
     def _handle_responses(self, payload):
         """Serve /v1/responses by translating to chat completions upstream."""
         session_key = extract_session_key(self.headers, payload)
@@ -9954,7 +10284,7 @@ class Handler(BaseHTTPRequestHandler):
         holder = {"usage": None, "custom_names": custom_names,
                   "allowed_names": _tool_names_from_payload(chat_req)}
         try:
-            req_realm = self._request_realm() or CURRENT_REALM
+            req_realm = self._request_realm()
             usage_ctx = {}          # P1-3：推理档位审计出参（下传给 open_upstream）
             blocked = self._model_precheck(chat_req.get("model"), req_realm)
             if blocked:
@@ -10235,6 +10565,24 @@ class Handler(BaseHTTPRequestHandler):
                 % (res.get("from"), res.get("to"), len(res.get("files") or []),
                    res.get("backup") or "-", restarted), tag="update")
             return self._json(200, dict(res, restarting=restarted))
+        if path == "/settings/web-tools":
+            # 本地 web 工具开关（面板 UI）：默认关，开/关都立即生效
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            try:
+                body = self._read_payload()
+            except Exception as exc:
+                return self._error(400, "invalid json: %s" % exc,
+                                   "invalid_request_error")
+            enabled = bool((body or {}).get("enabled"))
+            try:
+                qoder_settings.set_web_tools_enabled(ACCOUNTS_DIR, enabled)
+            except Exception as exc:
+                return self._error(500, "save failed: %s" % exc)
+            log("local web tools %s (panel)" % ("enabled" if enabled else "disabled"),
+                tag="webtools")
+            return self._json(200, {"ok": True, "web_tools": web_tools_enabled()})
         if path == "/settings/save":
             if not self._panel_ok():
                 return self._error(401, "panel password required",
@@ -10319,6 +10667,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if is_account_route:
             return self._handle_accounts(path, payload)
+        # 本地 web 工具：客户端声明了内置 web_search / web_fetch 时由网关代跑
+        if path in ("/v1/chat/completions", "/chat/completions",
+                    "/v1/responses", "/responses") and web_tools_enabled():
+            _web_names = builtin_web_tool_names(payload.get("tools") or [])
+            if _web_names:
+                return self._handle_web_tools(path, payload, _web_names)
         if path in ("/v1/responses", "/responses"):
             return self._handle_responses(payload)
         if path in ("/v1/messages", "/v1/messages/count_tokens"):
@@ -10341,7 +10695,7 @@ class Handler(BaseHTTPRequestHandler):
             % (model, effort, want_stream,
                len(payload.get("messages") or [])))
         try:
-            req_realm = self._request_realm() or CURRENT_REALM
+            req_realm = self._request_realm()
             usage_ctx = {}          # P1-3：推理档位审计出参（下传给 open_upstream）
             blocked = self._model_precheck(model, req_realm)
             if blocked:

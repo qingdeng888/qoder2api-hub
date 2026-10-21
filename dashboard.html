@@ -718,6 +718,14 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     </div>
   </div>
 
+  <section id="insightSection">
+    <h2>用量洞察 <em id="insightHint">费用估算 · 积分获取 · 剩余天数</em></h2>
+    <div class="cards" id="insightCards"></div>
+    <div class="table-wrap" id="grantsWrap" style="margin-top:12px"></div>
+    <div class="table-wrap" id="remainingWrap" style="margin-top:12px"></div>
+    <div class="table-wrap" id="activityWrap" style="margin-top:12px"></div>
+  </section>
+
   <div class="cards" id="cards"></div>
 
   <section>
@@ -1142,6 +1150,26 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
         <button class="sec mini" onclick="testProbeModel(this)">用该模型测试一次</button>
       </div>
       <div id="probeTestResult" style="margin-top:10px"></div>
+    </section>
+
+    <section id="sectionWebTools">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:10px">
+        <div>
+          <h2 style="margin:0">本地 web 工具 <em id="setWebToolsState"></em></h2>
+          <div style="font-size:12px;color:var(--dim);margin-top:4px;line-height:1.7">
+            开启后，客户端声明的内置 <code>web_search</code> / <code>web_fetch</code> 会由<b>网关本地执行</b>：
+            把声明换成同名 function，模型要搜索时网关去搜（DuckDuckGo → Bing → Wikipedia 轮换）、要抓页面时网关去抓，
+            再把结果回灌给模型继续生成（最多 3 轮）。
+            <br><b style="color:var(--warn)">注意</b>：这是唯一会由模型驱动出网的能力；每轮代跑都会多消耗一次账号额度；
+            私网地址、localhost、重定向到内网一律拒绝。默认关闭。
+          </div>
+        </div>
+        <label style="display:flex;align-items:center;gap:8px;font-size:13px;white-space:nowrap">
+          <input type="checkbox" id="setWebTools" onchange="saveWebTools(this)">
+          <span>启用</span>
+        </label>
+      </div>
+    </section>
     </section>
 
     <section id="sectionLimits">
@@ -2609,6 +2637,122 @@ async function saveSchedule(btn){
     if(btn){ btn.disabled = false; btn.textContent = "保存排程"; }
   }
 }
+
+// —— 用量洞察（跟进 wb：费用估算 / 积分获取历史 / 剩余用量估算）——
+let INSIGHT_GRANTS = [];
+let INSIGHT_REMAIN = [];
+
+function _usd(v){
+  if(v === null || v === undefined) return "—";
+  const n = Number(v);
+  if(!isFinite(n)) return "—";
+  if(n >= 1) return "$" + n.toFixed(2);
+  if(n >= 0.01) return "$" + n.toFixed(3);
+  return "$" + n.toFixed(4);
+}
+
+async function loadInsights(){
+  const cards = document.getElementById("insightCards");
+  if(!cards) return;
+  try{
+    const [usage, pricing, grants, remain, activity] = await Promise.all([
+      getJSON("/usage").catch(() => ({})),
+      getJSON("/pricing").catch(() => ({})),
+      getJSON("/accounts/credits/grants").catch(() => ({})),
+      getJSON("/usage/remaining").catch(() => ({})),
+      getJSON("/accounts/activity?limit=100").catch(() => ({})),
+    ]);
+    const cost = usage && usage.cost_usd != null ? usage.cost_usd : null;
+    const unpriced = (pricing && pricing.unpriced || []).length;
+    const gs = (grants && grants.summary) || {};
+    INSIGHT_GRANTS = (grants && grants.rows) || [];
+    INSIGHT_REMAIN = (remain && remain.rows) || [];
+    const days = INSIGHT_REMAIN.filter(r => r.days_left != null).map(r => r.days_left);
+    const minDays = days.length ? Math.min.apply(null, days) : null;
+    cards.innerHTML =
+      '<div class="card"><div class="val">' + _usd(cost) + '</div>'
+      + '<div class="lbl">API 等价花费（参考 OpenRouter 价）</div>'
+      + '<div class="hint" style="font-size:11px;color:var(--dim)">'
+      + (unpriced ? (unpriced + " 个模型未定价（显示 —）") : "全部模型已定价")
+      + '</div></div>'
+      + '<div class="card"><div class="val">' + (gs.count || 0) + '</div>'
+      + '<div class="lbl">积分包 / 获取记录</div>'
+      + '<div class="hint" style="font-size:11px;color:var(--dim)">剩余 '
+      + fmt(gs.remain) + ' / 面额 ' + fmt(gs.size) + '</div></div>'
+      + '<div class="card"><div class="val">'
+      + (minDays == null ? "—" : (minDays + " 天")) + '</div>'
+      + '<div class="lbl">最快耗尽账号（按近 24h 速率）</div>'
+      + '<div class="hint" style="font-size:11px;color:var(--dim)">仅线性外推，仅供参考</div></div>';
+    renderGrants();
+    renderRemaining();
+    renderActivity((activity && activity.rows) || [], (activity && activity.summary) || {});
+  }catch(e){
+    cards.innerHTML = '<div class="card"><div class="val">—</div><div class="lbl">用量洞察加载失败</div></div>';
+  }
+}
+
+
+function renderActivity(rows, summary){
+  const box = document.getElementById("activityWrap");
+  if(!box) return;
+  if(!rows || !rows.length){
+    box.innerHTML = '<div style="font-size:12px;color:var(--dim);margin:6px 0">签到 / 领取记录：暂无（执行一次签到后这里会出现）</div>';
+    return;
+  }
+  const kindName = k => k === "checkin" ? "签到" : (k === "claim" ? "领取" : (k || "动作"));
+  box.innerHTML = '<div style="font-size:12px;color:var(--dim);margin:6px 0">签到 / 领取记录（成功 '
+    + (summary.ok || 0) + ' · 失败 ' + (summary.failed || 0)
+    + ' · 累计积分 ' + fmt(summary.earned_credits) + '，30 天保留）</div>'
+    + '<table><thead><tr><th style="width:150px">时间</th><th style="width:80px">动作</th>'
+    + '<th style="width:110px">账号</th><th style="width:70px">结果</th>'
+    + '<th style="text-align:right;width:80px">积分</th><th>说明</th></tr></thead><tbody>'
+    + rows.slice(0, 100).map(r => {
+        const ts = r.ts ? new Date(r.ts * 1000).toLocaleString() : "—";
+        return '<tr><td class="mono" style="font-size:11px">' + esc(ts) + '</td>'
+          + '<td>' + esc(kindName(r.kind)) + '</td>'
+          + '<td>' + esc(r.nickname || r.uid || "") + '</td>'
+          + '<td>' + (r.ok ? '<span class="badge ok">成功</span>' : '<span class="badge bad">失败</span>') + '</td>'
+          + '<td style="text-align:right">' + fmt(r.amount) + '</td>'
+          + '<td style="color:var(--dim);font-size:11px">' + esc(r.detail || "") + '</td></tr>';
+      }).join("")
+    + '</tbody></table>';
+}
+function renderGrants(){
+  const box = document.getElementById("grantsWrap");
+  if(!box) return;
+  if(!INSIGHT_GRANTS.length){ box.innerHTML = ""; return; }
+  box.innerHTML = '<div style="font-size:12px;color:var(--dim);margin:6px 0">积分获取历史（来自最近一次积分快照）</div>'
+    + '<table><thead><tr><th style="width:90px">账号</th><th>名称</th>'
+    + '<th style="text-align:right;width:80px">面额</th>'
+    + '<th style="text-align:right;width:80px">剩余</th>'
+    + '<th style="text-align:right;width:80px">已用</th></tr></thead><tbody>'
+    + INSIGHT_GRANTS.slice(0, 50).map(r =>
+        '<tr><td>' + esc(r.account || "") + '</td>'
+        + '<td>' + esc(r.name || "") + '</td>'
+        + '<td style="text-align:right">' + fmt(r.size) + '</td>'
+        + '<td style="text-align:right">' + fmt(r.remain) + '</td>'
+        + '<td style="text-align:right">' + fmt(r.used) + '</td></tr>').join("")
+    + '</tbody></table>';
+}
+
+function renderRemaining(){
+  const box = document.getElementById("remainingWrap");
+  if(!box) return;
+  if(!INSIGHT_REMAIN.length){ box.innerHTML = ""; return; }
+  box.innerHTML = '<div style="font-size:12px;color:var(--dim);margin:6px 0">剩余用量估算（近 24 小时消耗外推）</div>'
+    + '<table><thead><tr><th style="width:120px">账号</th>'
+    + '<th style="text-align:right;width:90px">剩余积分</th>'
+    + '<th style="text-align:right;width:110px">24h 消耗</th>'
+    + '<th style="text-align:right;width:110px">24h tokens</th>'
+    + '<th style="text-align:right;width:110px">预计可用</th></tr></thead><tbody>'
+    + INSIGHT_REMAIN.map(r =>
+        '<tr><td>' + esc(r.account || "") + '</td>'
+        + '<td style="text-align:right">' + (r.unlimited ? "无限" : fmt(r.remain)) + '</td>'
+        + '<td style="text-align:right">' + fmt(r.used_24h_credit) + '</td>'
+        + '<td style="text-align:right">' + fmt(r.used_24h_tokens) + '</td>'
+        + '<td style="text-align:right">' + (r.days_left == null ? "—" : (r.days_left + " 天")) + '</td></tr>').join("")
+    + '</tbody></table>';
+}
 async function loadSchedulerStatus(){
   try{
     const s = await getJSON("/scheduler");
@@ -2669,6 +2813,7 @@ async function toggleScheduler(btn){
   try{
     const r = await postJSON("/scheduler/toggle", {});
     await loadSchedulerStatus();
+    loadInsights();
     toast("后台调度器已" + (r.enabled ? "启用" : "暂停"), "ok");
   }catch(e){
     toast("切换失败: " + e.message, "bad");
@@ -4078,6 +4223,7 @@ async function startDashboard(){
     }, 5000),
     setInterval(refresh, 5000),
     setInterval(loadSchedulerStatus, 30000),
+    setInterval(loadInsights, 30000),
     setInterval(loadAccounts, 15000),
   ];
 }
@@ -4085,6 +4231,10 @@ async function startDashboard(){
 async function loadSettings(showToast){
   try {
     const data = await getJSON('/settings');
+    const wtBox = document.getElementById('setWebTools');
+    if(wtBox) wtBox.checked = data.web_tools === true;
+    const wtState = document.getElementById('setWebToolsState');
+    if(wtState) wtState.textContent = data.web_tools ? '(已开启)' : '(已关闭)';
     const pwdState = document.getElementById('setPwdState');
     if(pwdState){
       pwdState.textContent = data.panel_password_is_default ? '(当前为默认密码)' : '(已自定义)';
@@ -4133,6 +4283,23 @@ async function loadSettings(showToast){
   }
 }
 
+
+// 本地 web 工具开关（唯一由模型驱动出网的能力，默认关闭）
+async function saveWebTools(el){
+  const on = !!(el && el.checked);
+  el.disabled = true;
+  try{
+    const r = await postJSON("/settings/web-tools", {enabled: on});
+    toast("本地 web 工具已" + (r.web_tools ? "开启" : "关闭"), "ok");
+    const st = document.getElementById("setWebToolsState");
+    if(st) st.textContent = r.web_tools ? "(已开启)" : "(已关闭)";
+  }catch(e){
+    toast("保存失败: " + ((e && e.message) || e), "bad");
+    el.checked = !on;
+  }finally{
+    el.disabled = false;
+  }
+}
 async function savePanelPassword(btn){
   const cur = (document.getElementById('setPwdCurrent') || {}).value || '';
   const nw = (document.getElementById('setPwdNew') || {}).value || '';

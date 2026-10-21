@@ -1,6 +1,6 @@
 # 更新日志
 
-每个版本的发布说明同步在 [GitHub Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+每个版本的发布说明同步在 [GitHub Releases](https://github.com/qingdeng888/qoder2api-hub/releases)。
 
 ## 版本号规则
 
@@ -9,20 +9,91 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
-## v1.6.1-fork
+## v1.6.4-fork
 
-本 fork 在上游 v1.6.1 之上叠加的能力（默认都不改变原有行为）：
+本 fork 在上游 v1.6.4 之上叠加的能力（默认都不改变原有行为）：
 
 - **出站代理池**：HTTP/HTTPS/**SOCKS4/4a/5/5h**；`rotate` / `sticky` / `random` / `single`；传输层失败换出口、连续失败指数冷却、后台健康检查、直连兜底；面板支持全选与批量启用/停用/测试/清冷却/删除。
 - **账号级出口绑定**：`默认 / auto / bind / rotate / direct`，随账号 JSON 持久化，覆盖推理、模型清单、刷新、额度与签到。
 - **API 连通性测试**：用本地 Key 向本网关发一次真实请求，验证 Key → 路由/账号/代理 → 上游 → 响应全链路。
 - **可自定义检测模型**（`probe_model`）：连通性测试、账号「测试」与 403 冷却判定统一使用它；留空 = `Qwen3.8-Flash`。
 - **403 自动禁用策略**：只有**检测模型**的 403 才冷却/自动禁用账号（2 小时后自动恢复）；付费模型 403、付费墙 112、排队 10605、内容审核、参数错一律不动账号。
-- **账号备注**：与上游 `note` 同源（本 fork 的 `remark` 是它的别名），两条接口都可用。
+- **账号备注**：与上游 `note` 同源（`remark` 是别名），`/accounts/note` 与 `/accounts/remark` 都可用。
 - **自动构建镜像**：push `main` 即构建 `ghcr.io/qingdeng888/qoder2api-hub:latest`，`v*` tag 追加语义化版本。
 - **宿主机原生部署**：`run-local.sh` + `.env.local` + systemd unit。
 
-合并说明：本次把上游从 v1.5.5 一路合到 **v1.6.1**（含 #56–#74 全部修复与 v1.6.0 的可配置排程），冲突集中在 403/排队处理与账号备注两处，处理原则是**两边都保留**——排队的短路逻辑与 10605 文案采用上游实现，账号级 403 的自动禁用与探测模型口径保留本 fork 版本。
+合并说明：本次把上游从 v1.6.1 合到 **v1.6.4**（#75 身份对齐 / #76 自动换区 / #77 合并 / 用量洞察 #78 / 本地 web 工具），
+冲突集中在 出站依赖导入、设置页区块、面板设置视图与 `open_upstream` 签名四处，处理原则是**两边都保留**：
+上游的 `qoder_pricing` / `qoder_webtools` / `WEB_TOOLS_MAX_ROUNDS` 全部接入，本 fork 的代理池、探测模型与
+`allow_queue_wait` 参数保持不变。
+
+## v1.6.4
+
+**✨ 新增功能：本地 web 工具（默认关闭）**
+
+客户端（Codex 等）在请求里声明的内置 `web_search` / `web_fetch`，Qoder 上游不会执行——此前被直接丢弃（#63），客户端以为能联网、实际永远调不到。现在可以交给网关**本地执行**：
+
+1. **声明改写**：把 `web_search` / `web_search_preview` / `web_fetch` 换成网关自己的同名 function；
+2. **本地执行**：搜索走 DuckDuckGo → Bing → Wikipedia 轮换（含 TTL 缓存、single-flight、节流、被封冷却），`web_fetch` 抓模型给出的 URL；
+3. **结果回灌**：把结果作为 tool 消息追加，再开一轮上游继续生成，最多 3 轮（`QD_WEB_TOOLS_ROUNDS`）。
+
+**安全边界**（这是唯一由模型驱动出网的能力）：
+
+- 只允许 `http/https`，拒绝带凭据的 URL、`localhost`、私网 / 链路本地地址（含 `169.254.169.254`）；
+- 重定向**逐跳复检**，重定向到内网直接失败；
+- 响应体 4MB、正文 20000 字上限，固定超时；
+- 配置代理时由代理做 DNS 解析（仍拦字面私网地址）。
+
+**开关**：看板「设置 → 本地 web 工具」复选框（持久化在 `accounts/settings.json` 的 `web_tools`，改完立即生效）；`QD_WEB_TOOLS=on/off` 环境变量优先。**默认关闭**。
+
+**代价**：每代跑一轮都会多消耗一次账号额度。
+
+**验证**：新增 `tests/_test_web_tools.py`（24 条：SSRF 七种拒绝形态、声明改写、开关优先级、工具执行、接线守卫）；全量 **56 suites / 1725 checks / 0 failed**。
+
+## v1.6.3
+
+**✨ 新增功能：用量洞察（移植 wb 的三项能力）**
+
+- **费用估算**：按「缓存命中 / 未命中输入 + 输出」三档单价（USD / 1M tokens）把每条请求折算成等价金额。
+  - `GET /pricing` 返回价目表与**未定价模型清单**（未收录的显示 `—`，绝不猜数字）；
+  - 单价可用 `usage/pricing-overrides.json` 覆盖（支持 `{in,cached,out}` 或三元数组），改完 30 秒内生效；
+  - `/usage` 快照新增 `cost_usd` 与 `unpriced`，面板「用量洞察」卡片显示合计；
+  - 口径说明：**参考 OpenRouter 公布价**，不等于官方积分，不能用于结算。
+- **积分获取记录**：`GET /accounts/credits/grants` 把各账号积分包摊平成一张表（名称 / 面额 / 剩余 / 已用），只读内存快照、不发上游请求。
+- **剩余用量估算**：`GET /usage/remaining` 给出每账号「剩余积分 / 近 24h 消耗 / 近 24h tokens / 预计可用天数」，按近 24h 速率线性外推（仅参考）。
+- **签到 / 领取动作流水**：新增 `qoder_activity`，`POST /accounts/checkin` 与领取动作会往 `usage/activity.jsonl` 追加一行（时间 / 动作 / 账号 / 结果 / 积分 / 说明），5MB 自动轮转、读接口保留 30 天；`GET /accounts/activity` 按时间倒序返回并给出成功/失败/累计积分汇总。
+
+**🎨 面板**
+
+- 新增「用量洞察」区块：等价花费卡片（含未定价数量）、积分包卡片、最快耗尽账号卡片，以及三张明细表（积分包 / 剩余用量 / 动作流水），30 秒自动刷新。
+
+**📚 文档**：`docs/api.md` 增补四个端点与计价口径、覆盖文件格式。
+
+**验证**：新增 `tests/_test_insights.py`（23 条）；全量 **55 suites / 1701 checks / 0 failed**。
+
+## v1.6.2
+
+**🐛 问题修复**
+
+- **未指定出口的请求被入口层钉死当前区**（#76，PR #77 by ZaneCJP）：三个请求入口都写成 `self._request_realm() or CURRENT_REALM`，把「用户没指定出口」折叠成「当前区」——于是区域独占模型在 `_model_precheck` 阶段直接 400，`open_upstream` 里基于模型的自动路由分支永远进不去。现在三个入口一律传 `None`，由路由层按模型/账号自动选；`X-Realm` / `?realm=` / Key 绑区的显式优先级逐字节不变，`GET /v1/models` 的两个端点仍保留确定区域。新增 `tests/_test_issue76_auto_realm.py`（21 条 + 金丝雀自证）。
+
+**🔧 身份形态对齐（PR #75 by maiphucguy）**
+
+对照官方 **桌面端 0.4.8 / qodercli 1.1.75** 静态核对后修正出站形态：
+
+- **推理链路**：UA 改为官方 CLI 同款 `undici`（此前是 `Go-http-client/2.0`，等于自报脚本）；`cosy-version` 升到 `1.1.75`（可用 `QD_COSY_VERSION` 覆盖）；补 `cosy-business-product` / `cosy-business-type` / `cosy-scene`，`cosy-data-policy` 改小写；`cosy-machineos` 所有请求都带。
+- **签到 / 活动链路**：请求头改为官方桌面端的精确集合（不再叠 `X-Request-ID` / `Origin` / `Referer` 等）；`Cosy-MachineHostname` 取本机主机名（按官方规整规则），`Cosy-MachineOS` 用真实的 `{arch}_{platform}`，`Cosy-Version` 升到 `0.4.8`；runtime-info 环境码 cn=`0` / intl=`3`，且只有 darwin/win32 带 `--account-stdin`。
+- **UMID 组件发现**：覆盖三端默认安装目录（Windows launcher/Programs/ProgramFiles、macOS `.app`、Linux `/opt`）；Windows 未装桌面端时回退 `QD_UMID_DIR` 或仓库 `umid/`；`_install_umid.py` 支持 `--platform win32`（按 PE 的 DLL 标志位区分 exe/dll）。
+- **身份缓存**：落盘缓存记录 `environment`，缺字段或与当前环境码不符时作废重取。
+
+**⚠️ 升级影响（务必看）**
+
+1. **身份会重新获取一次**：旧缓存没有 `environment`，升级后首次走活动链路会重取并写回，之后照常复用。
+2. **会上报主机名**：签到/活动请求带本机主机名（与官方桌面端一致）。Docker 默认主机名是容器 ID，每次重建会变；想固定请在 compose 里设 `hostname:`。
+3. **Linux / Docker 的 `Cosy-MachineOS` 会变**：从 `x86_64_win32` 变为 `x86_64_linux`（与推理链路一致）。想保持旧指纹可设 `QD_COSY_MACHINE_OS=x86_64_win32`；设为 `auto` 则按系统架构自动识别。
+4. **推理请求 UA 变化**：`Go-http-client/2.0` → `undici`。
+
+**验证**：PR #77 独立 54 suites / 1662 checks；PR #75 独立 53 suites / 1656 checks；合并后全量 **54 suites / 1678 checks / 0 failed**。
 
 ## v1.6.1
 

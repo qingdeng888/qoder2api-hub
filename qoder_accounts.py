@@ -15,12 +15,14 @@
 import base64
 import collections
 import datetime
+import hashlib
 import ipaddress
 import json
 import os
 import re
 import socket
 import ssl
+import sys
 import threading
 import time
 import urllib.error
@@ -33,6 +35,7 @@ from qoder_fingerprint import (derive_id, generate_request_id,
                                derive_machine_token, derive_machine_type,
                                vm_status)
 import qoder_proxypool
+from qoder_sign import COSY_MACHINE_OS
 
 # ---------------------------------------------------------------------------
 # 区域常量（逆向自官方桌面/CLI 客户端）
@@ -46,7 +49,7 @@ REALM_CONFIGS = {
         "client_id": "1c5e33e1-364d-4ce6-b02c-acaa81274a5c",
         "redirect_uri": "qoder-work-cn://",
         "domain": "qoder.com.cn",
-        "ua": "QoderWork/1.1.64",
+        "ua": "QoderWork/1.1.75",
         # has_checkin 只是"历史上该区域曾开放 sash 签到"的提示位，**不再作为
         # 门控**：能力改为运行时探测（见 Account.checkin_capability）。官方把
         # 每日领取活动搬到 campaign 平台后，任何区域都可能新增/下线接口。
@@ -73,7 +76,7 @@ REALM_CONFIGS = {
         "client_id": "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb",
         "redirect_uri": "qoder://aicoding.aicoding-agent/login-success",
         "domain": "qoder.com",
-        "ua": "Qoder/1.1.64",
+        "ua": "Qoder/1.1.75",
         # 国际版目前 /sash/api/v1/me/daily-check-in/* 返回 404（实测），但活动
         # 页面同样挂着"每日领取 100 Credits"。该字段仅作提示，门控靠运行时探测。
         "has_checkin": False,
@@ -115,9 +118,47 @@ PATH_CAMPAIGN_CLAIM = "/sash/api/v1/me/campaigns/%s/claim"
 
 # 桌面端专用请求头（活动平台必需；CLI=5 / QoderWork=6 / 桌面端=10）
 DESKTOP_CLIENT_TYPE = "10"
-DESKTOP_CLIENT_VERSION = "0.4.3"      # 可用 QD_DESKTOP_VERSION 覆盖
-MACHINE_OS = "x86_64_win32"
-MACHINE_HOSTNAME = "DESKTOP-QODER"
+DESKTOP_CLIENT_VERSION = "0.4.8"      # 可用 QD_DESKTOP_VERSION 覆盖
+MACHINE_OS = COSY_MACHINE_OS          # 与推理链路共用同一取值
+
+# 主机名规整规则逐字复刻官方桌面端 / CLI：可打印 ASCII 原样用，否则先试 IDNA，
+# 再不行就把非法字符折成 "-" 并加 sha256 前 8 位；超过 96 字符截断加哈希。
+_HEADER_SAFE_RE = re.compile(r"[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?")
+_HOSTNAME_MAX_LEN = 96
+_HOSTNAME_HASH_LEN = 8
+
+
+def _hostname_hash(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:_HOSTNAME_HASH_LEN]
+
+
+def _cap_hostname(text):
+    if len(text) <= _HOSTNAME_MAX_LEN:
+        return text
+    head = re.sub(r"[-\s]+$", "", text[:_HOSTNAME_MAX_LEN - _HOSTNAME_HASH_LEN - 1])
+    return "%s-%s" % (head or "unknown", _hostname_hash(text))
+
+
+def _header_safe_hostname(raw):
+    """把主机名规整成可放进请求头的值；空主机名返回空串（此时不发该头）。"""
+    name = (raw or "").strip()
+    if not name:
+        return ""
+    if _HEADER_SAFE_RE.fullmatch(name):
+        return _cap_hostname(name)
+    try:
+        ascii_name = name.encode("idna").decode("ascii")
+    except UnicodeError:
+        ascii_name = ""
+    if ascii_name and _HEADER_SAFE_RE.fullmatch(ascii_name):
+        return _cap_hostname(ascii_name)
+    slug = re.sub(r"-{2,}", "-", re.sub(r"[^\x21-\x7e]+", "-", name)).strip("-")
+    return _cap_hostname("%s-%s" % (slug or "unknown", _hostname_hash(name)))
+
+
+# 官方桌面端在活动请求里发本机真实主机名（规整后）。Docker 每次重建容器
+# 主机名都会变，想固定可用 `docker run --hostname` / compose 的 hostname:。
+MACHINE_HOSTNAME = _header_safe_hostname(socket.gethostname())
 
 
 def desktop_version():
@@ -130,9 +171,9 @@ def desktop_version():
 # ---------------------------------------------------------------------------
 # 官方桌面端原生风控身份（activity/campaign 列表按它过滤，必须是"真"身份）
 # ---------------------------------------------------------------------------
-# 官方桌面端在调用活动平台前，会 spawn 自己的原生桥取机器身份：
-#     <install>/resources/umid/runtime-info.exe prod --account-stdin
-#     stdin: {"account": <uid>}   stdout: {"machineToken","machineType","machineCode",...}
+# 官方客户端在调用活动平台前，会 spawn 自己的原生桥取机器身份：
+#     <install>/resources/umid/runtime-info[.exe] <0|3> [--account-stdin]
+#     stdin: {"account": <uid>}\n（仅 darwin/win32）   stdout: {"machineToken","machineType","machineCode",...}
 # 服务端**按这些值过滤设备定向活动**：派生的假身份不会报错，但活动列表里
 # 会静默少掉"每日领取 100 Credits"这类条目（实测：换用原生身份后立刻出现
 # CLAIMABLE 活动）。因此网关优先调用同一个官方二进制取真值，失败才回退派生值。
@@ -196,20 +237,37 @@ def _read_ini(path, key):
 
 
 def desktop_install_dir(realm):
-    """桌面端安装目录（launcher state.ini 的 installDir；找不到返回空串）。"""
-    base = _localappdata()
+    """桌面端安装目录（Windows / macOS / Linux 全平台；找不到返回空串）。"""
     names = ("Qoder CN", "QoderCN", "Qoder") if realm == "cn" else ("Qoder",)
-    for name in names:
-        for launcher in ("%s Launcher" % name, "Launcher"):
-            ini = os.path.join(base, name, launcher, "state.ini")
-            if os.path.isfile(ini):
-                d = _read_ini(ini, "installDir")
-                if d and os.path.isdir(d):
+    if os.name == "nt":
+        base = _localappdata()
+        for name in names:
+            for launcher in ("%s Launcher" % name, "Launcher"):
+                ini = os.path.join(base, name, launcher, "state.ini")
+                if os.path.isfile(ini):
+                    d = _read_ini(ini, "installDir")
+                    if d and os.path.isdir(d):
+                        return d
+        for name in names:
+            for root in (os.path.join(base, "Programs"),
+                         os.environ.get("ProgramFiles") or ""):
+                if not root:
+                    continue
+                d = os.path.join(root, name)
+                if os.path.isdir(d):
                     return d
-    for name in names:
-        d = os.path.join(base, "Programs", name)
-        if os.path.isdir(d):
-            return d
+    elif sys.platform == "darwin":
+        home_apps = os.path.join(os.path.expanduser("~"), "Applications")
+        for app_root in ("/Applications", home_apps):
+            for name in names:
+                d = os.path.join(app_root, "%s.app" % name, "Contents")
+                if os.path.isdir(d):
+                    return d
+    else:
+        for name in names:
+            for cand in ("/opt/%s" % name, "/usr/share/%s" % name.lower()):
+                if os.path.isdir(cand):
+                    return cand
     return ""
 
 
@@ -217,10 +275,10 @@ def runtime_info_exe(realm):
     """定位 runtime-info 原生风控身份桥；找不到返回空串。
 
     查找顺序（先桌面客户端，再提取目录）：
-      1. <桌面客户端安装目录>/resources/umid/runtime-info.exe（Windows 桌面端）；
-      2. POSIX：$QD_UMID_DIR/runtime-info、<repo>/umid/runtime-info
-         （由 _install_umid.py 从 @qoder-ai/qodercli 提取；两者调用契约一致。
-          Windows 不参与此分支，保持原有桌面客户端路径逐字不变）。
+      1. <桌面客户端安装目录>/{resources,Resources}/umid/runtime-info[.exe]；
+      2. 提取目录 $QD_UMID_DIR、<repo>/umid：
+         - Windows：runtime-info.exe（需同目录存在 sgsdk.dll）；
+         - POSIX：runtime-info（由 _install_umid.py 提取）。
 
     可用 QD_NATIVE_IDENTITY=0 关闭（测试/受限环境不希望拉起客户端二进制时）。
     """
@@ -229,26 +287,38 @@ def runtime_info_exe(realm):
     if realm in _native_exe_cache:
         return _native_exe_cache[realm]
     found = ""
-    roots = [os.path.join(desktop_install_dir(realm), "resources", "umid")]
-    for root in roots:
-        cand = os.path.join(root, "runtime-info.exe")
-        if os.path.isfile(cand):
-            found = cand
-            break
-    if not found and os.name == "posix":
-        # 提取目录（_install_umid.py 的落地位置；Windows 不参与本分支，
-        # 保持原有桌面客户端路径逐字不变）：显式 QD_UMID_DIR 优先于约定目录。
+    inst_dir = desktop_install_dir(realm)
+    if inst_dir:
+        exe_names = ("runtime-info.exe",) if os.name == "nt" else ("runtime-info",)
+        for res_sub in ("resources", "Resources"):
+            root = os.path.join(inst_dir, res_sub, "umid")
+            for exe_name in exe_names:
+                cand = os.path.join(root, exe_name)
+                if os.path.isfile(cand):
+                    found = cand
+                    break
+            if found:
+                break
+    if not found:
         extracted = []
         umid_dir = (os.environ.get("QD_UMID_DIR") or "").strip()
         if umid_dir:
             extracted.append(umid_dir)
         extracted.append(os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "umid"))
-        for root in extracted:
-            cand = os.path.join(root, "runtime-info")
-            if os.path.isfile(cand):
-                found = cand
-                break
+        if os.name == "nt":
+            for root in extracted:
+                cand = os.path.join(root, "runtime-info.exe")
+                dll = os.path.join(root, "sgsdk.dll")
+                if os.path.isfile(cand) and os.path.isfile(dll):
+                    found = cand
+                    break
+        else:
+            for root in extracted:
+                cand = os.path.join(root, "runtime-info")
+                if os.path.isfile(cand):
+                    found = cand
+                    break
     _native_exe_cache[realm] = found
     return found
 
@@ -270,14 +340,28 @@ def _runtime_info_warn(category, message):
         return
     _runtime_info_warned.add(category)
     try:
-        import sys
         print("[runtime-info] %s" % message, file=sys.stderr)
     except Exception:
         pass
 
 
+def _runtime_info_env(realm):
+    """返回传给 runtime-info 的环境码：国内版 ONLINE="0"，国际版 US_ONLINE="3"。
+
+    对齐官方桌面端 0.4.8 主进程（`region === "global" ? 3 : 0`）：这份身份只用于
+    桌面端同款的活动请求头，所以跟桌面端走；官方 CLI 国际版传的是 SINGAPORE=4。
+    可用 QD_RUNTIME_INFO_ENV 覆盖。"""
+    default = "3" if realm == "intl" else "0"
+    return (os.environ.get("QD_RUNTIME_INFO_ENV") or default).strip() or default
+
+
 def run_runtime_info(realm, account_id=""):
     """调用 runtime-info 原生桥，返回其 JSON（失败返回 {}）。
+
+    调用契约对齐官方桌面端 0.4.8 / CLI 1.1.75：argv 为按区域的数字环境码（见
+    _runtime_info_env）；
+    仅 darwin / win32 且有 account_id 时附带 --account-stdin，stdin 为
+    `{"account": <uid>}\\n`，其余情况 stdin 直接 EOF。
 
     account 为空串同样可用：机器身份是机器级的，活动平台之外（如虚拟化体检）
     不需要账号上下文。
@@ -289,11 +373,16 @@ def run_runtime_info(realm, account_id=""):
     exe = runtime_info_exe(realm)
     if not exe:
         return {}
+    cmd = [exe, _runtime_info_env(realm)]
+    stdin_bytes = b""
+    if sys.platform in ("darwin", "win32") and account_id:
+        cmd.append("--account-stdin")
+        stdin_bytes = (json.dumps({"account": account_id}, separators=(",", ":"))
+                       + "\n").encode("utf-8")
     try:
         import subprocess
         proc = subprocess.run(
-            [exe, "prod", "--account-stdin"],
-            input=json.dumps({"account": account_id or ""}).encode("utf-8") + b" ",
+            cmd, input=stdin_bytes,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25,
             cwd=os.path.dirname(exe))
         out = proc.stdout.decode("utf-8", "replace").strip()
@@ -401,7 +490,6 @@ def _identity_cache_ttl():
 def _identity_cache_log(level, message):
     """缓存事件输出到 stderr；去重由各调用点的标记控制。"""
     try:
-        import sys
         print("[machine-identity] %s: %s" % (level, message), file=sys.stderr)
     except Exception:
         pass
@@ -420,6 +508,7 @@ def _identity_entry_to_ident(entry):
     return {"machineToken": token, "machineType": mtype, "machineCode": code,
             "vm": bool(entry.get("vm")),
             "vm_info": vm_info,
+            "environment": str(entry.get("environment") or "").strip(),
             "source": str(entry.get("source") or MACHINE_IDENTITY_NATIVE)}
 
 
@@ -465,7 +554,7 @@ def _read_identity_cache_doc():
 
 
 def _load_identity_cache(realm, now, allow_expired=False):
-    """读落盘缓存；返回 ident dict 或 None（无 / 损坏 / 字段不全 / 过期）。"""
+    """读落盘缓存；返回 ident dict 或 None（无 / 损坏 / 字段不全 / 环境不符 / 过期）。"""
     entry = (_read_identity_cache_doc().get("realm") or {}).get(realm)
     if entry is None:
         return None
@@ -473,8 +562,11 @@ def _load_identity_cache(realm, now, allow_expired=False):
     if ident is None:
         _identity_cache_warn_corrupt("missing fields")
         return None
-    if not allow_expired and _identity_entry_expired(entry, _identity_cache_ttl(), now):
-        return None
+    if not allow_expired:
+        if ident.get("environment") != _runtime_info_env(realm):
+            return None
+        if _identity_entry_expired(entry, _identity_cache_ttl(), now):
+            return None
     return ident
 
 
@@ -485,7 +577,8 @@ def _identity_cache_expired_entry_exists(realm, now):
     （让"定期轮换"真的换出新身份，见 _purge_identity_seed）。
     """
     entry = (_read_identity_cache_doc().get("realm") or {}).get(realm)
-    if entry is None or _identity_entry_to_ident(entry) is None:
+    ident = _identity_entry_to_ident(entry) if entry is not None else None
+    if ident is None or ident.get("environment") != _runtime_info_env(realm):
         return False
     return _identity_entry_expired(entry, _identity_cache_ttl(), now)
 
@@ -516,12 +609,14 @@ def _save_identity_cache(realm, ident, force=False):
     另一个实例刚写入未过期的缓存，见设计 §4②"keeping cached"）。
     """
     global _identity_cache_diff_warned
+    expected_env = _runtime_info_env(realm)
     with _IDENTITY_CACHE_LOCK:
         doc = _read_identity_cache_doc()
         realms = doc.setdefault("realm", {})
         old_entry = realms.get(realm)
         old_ident = _identity_entry_to_ident(old_entry) if old_entry else None
         if (not force and old_ident is not None
+                and old_ident.get("environment") == expected_env
                 and not _identity_entry_expired(old_entry, _identity_cache_ttl(),
                                                 time.time())
                 and old_ident != ident):
@@ -532,6 +627,7 @@ def _save_identity_cache(realm, ident, force=False):
                     "identity cache differs from fresh component output; keeping cached")
             return old_ident
         entry = dict(ident)
+        entry["environment"] = expected_env
         entry["cached_at"] = time.time()
         realms[realm] = entry
         doc["version"] = 1
@@ -606,6 +702,7 @@ def _sample_identity(realm, account_id):
     return {"machineToken": token, "machineType": mtype, "machineCode": code,
             "vm": bool(vm_info.get("isVm")),
             "vm_info": vm_info,
+            "environment": _runtime_info_env(realm),
             "source": MACHINE_IDENTITY_NATIVE}
 
 
@@ -1992,7 +2089,7 @@ class Account(object):
             # （Go 语言 HTTP 客户端的默认值 "Go-http-client/2.0"），而 Qoder
             # 官方客户端是 Electron/Node 应用，绝不可能发出这个 UA —— 等于在
             # 每个 openapi 请求上自报「我是脚本」。REALM_CONFIGS 里本来就有
-            # 官方 UA（CN: QoderWork/1.1.64，INTL: Qoder/1.1.64），直接用。
+            # 按区域的官方 UA（CN: QoderWork/…，INTL: Qoder/…），直接用。
             "User-Agent": cfg.get("ua") or CLIENT_UA,
             "Authorization": "Bearer " + self.access_token,
             "X-Request-ID": generate_request_id(self.uid),
@@ -2003,15 +2100,19 @@ class Account(object):
         }
 
     def desktop_headers(self):
-        """桌面端 0.4.3 同款出站头（活动平台 /sash/... 必需）。
+        """桌面端同款出站头（活动平台 /sash/... 必需）。
 
-        官方桌面端调用 `/sash/api/v1/me/campaigns` 时携带：
-          Authorization: Bearer <token>
+        对齐官方桌面端 0.4.8 主进程调用 `/sash/api/v1/me/campaigns` 的完整头集合
+        （createRequestHeaders + createAuthorizedHeaders），不多不少：
+          Accept: application/json
           User-Agent: Qoder
+          Authorization: Bearer <token>
           Cosy-ClientType: 10（桌面端；CLI 是 5、QoderWork 是 6）
           Cosy-Version: <桌面端版本>
-          Cosy-MachineOS / MachineHostname / MachineId / MachineToken /
-          MachineType / MachineCode
+          Cosy-MachineOS / MachineHostname（本机主机名）/ MachineId /
+          MachineToken / MachineType / MachineCode
+        没有 Content-Type / X-Request-ID / X-Machine-ID / Origin / Referer；
+        带请求体的调用（claim）由调用方自行补 Content-Type。
 
         两层坑（都已踩过）：
           1. 缺 UA / cosy-clienttype / cosy-version → 服务端不报错但返回
@@ -2029,10 +2130,13 @@ class Account(object):
             六头，只发 UA / cosy-clienttype / cosy-version。
         machine_identity_source 依旧如实记录（看板与诊断在用）。
         """
-        h = dict(self.headers())
-        h["User-Agent"] = "Qoder"
-        h["cosy-clienttype"] = DESKTOP_CLIENT_TYPE
-        h["cosy-version"] = desktop_version()
+        h = {
+            "Accept": "application/json",
+            "User-Agent": "Qoder",
+            "Authorization": "Bearer " + self.access_token,
+            "cosy-clienttype": DESKTOP_CLIENT_TYPE,
+            "cosy-version": desktop_version(),
+        }
         ident = native_machine_identity(self.realm, self.uid)
         if ident.get("machineToken"):
             # 仅原生身份可用时发送机器头（issue #10：派生六头会被服务端判定
@@ -2045,7 +2149,8 @@ class Account(object):
             h["cosy-machinecode"] = ident.get("machineCode") or \
                 derive_id(self.uid, "machinecode")
             h["cosy-machineos"] = MACHINE_OS
-            h["cosy-machinehostname"] = MACHINE_HOSTNAME
+            if MACHINE_HOSTNAME:
+                h["cosy-machinehostname"] = MACHINE_HOSTNAME
             self.machine_headers_state = MACHINE_HEADERS_NATIVE
         else:
             # 无原生桥：一个机器头都不发（issue #10）。状态如实登记，供
@@ -2471,8 +2576,11 @@ class Account(object):
         cfg = get_realm_config(self.realm)
         url = cfg["openapi"] + (PATH_CAMPAIGN_CLAIM % campaign_id)
         try:
+            headers = self.desktop_headers()
+            headers["Content-Type"] = "application/json"
             r = http_json(url, data=b"{}", method="POST",
-                          headers=self.desktop_headers(), timeout=20, retries=1, account=self)
+                          headers=headers, timeout=20, retries=1,
+                          account=self)
         except urllib.error.HTTPError as exc:
             try:
                 body = exc.read().decode("utf-8", "replace")
