@@ -1710,7 +1710,40 @@ def known_client_names():
 #       Kimi-K2.7-Code 等按官方原样保留）
 # 运行时优先实时读取客户端资源（客户端更新自动同步），失败回退内嵌快照。
 # ---------------------------------------------------------------------------
-_EMBEDDED_MODEL_TEXT = json.loads('{"descriptions": {"auto": "智能选择最适合的模型，平衡性能与成本", "lite": "基础推理能力，免费使用（高峰期可能响应较慢）", "cmodel": "尝鲜体验全球顶级模型，擅长超长自主任务执行", "dmodel": "深度求索正式版模型（DeepSeek-V4-Pro-0813），Agent 能力、世界知识与推理性能全面领先。", "gmodel": "智谱旗舰模型，擅长复杂系统工程与长程任务", "kmodel": "专为长上下文编程打造：精准遵循指令，可靠执行长链路任务", "mmodel": "原生多模态感知、前沿编码能力与 1M 上下文，驾驭高复杂度工作流", "qmodel": "千问旗舰模型，增强推理和智能体能力，擅长编程与复杂问题解决", "dfmodel": "深度求索正式版模型（DeepSeek-V4-Flash-0731），Agent 能力、世界知识与推理性能全面领先。", "gfmodel": "智谱全新原生多模态模型，深度理解图像与视频，自主完成研究分析、文档制作等复杂任务", "qfmodel": "千问开源权重的多模态 MoE 模型，在能力、延迟与成本间取得出色平衡", "ultimate": "专家级深度推理与思考能力，极致输出质量。", "efficient": "标准推理能力，高性价比", "performance": "高级推理能力，高质量输出", "qmodel_38max": "千问最新一代基座模型，2.4 万亿参数，在代码工程、专业办公、深度推理等核心场景全面领先", "kmodel_latest": "Kimi 迄今最强模型：2.8 万亿参数，面向软件工程、知识工作与深度推理而生", "qmodel_latest": "千问旗舰模型，具备顶尖智能体执行能力，可自主完成长达 35 小时的复杂任务"}, "labels": {"auto": "Auto", "lite": "轻量", "cmodel": "Cantus", "dmodel": "DeepSeek-V4-Pro", "gmodel": "GLM-5.3", "kmodel": "Kimi-K2.7-Code", "mmodel": "MiniMax-M3", "qmodel": "Qwen3.7-Plus", "dfmodel": "DeepSeek-V4-Flash", "gfmodel": "GLM-5.3-Flash", "qfmodel": "Qwen3.8-Flash", "ultimate": "极致", "efficient": "经济", "performance": "性能", "qmodel_38max": "Qwen3.8-Max", "kmodel_latest": "Kimi-K3", "qmodel_latest": "Qwen3.7-Max"}}')
+_EMBEDDED_MODEL_TEXT = {
+    # issue #68：文案按 Qoder 现行文档对齐，**不再写死版本号**
+    # （旧快照里的 0731/0813 早已下线，只会误导 model picker）。
+    "descriptions": {
+        "auto": "智能选择最适合的模型，平衡性能与成本",
+        "lite": "基础推理能力，免费使用（高峰期可能响应较慢）",
+        "cmodel": "尝鲜体验全球顶级模型，擅长超长自主任务执行",
+        "dmodel": "复杂推理、代码生成与工程任务表现卓越",
+        "gmodel": "智谱开源旗舰模型，代码能力对标国际顶尖水平，兼具安全审查与漏洞推理能力",
+        "kmodel": "专为长上下文编程打造：精准遵循指令，可靠执行长链路任务",
+        "mmodel": "原生多模态感知、前沿编码能力，以及 1M 上下文深度，适合高强度工作流",
+        "qmodel": "推理能力、效率与多模态体验的全面跃迁",
+        "dfmodel": "推理速度快且成本低廉，综合能力均衡",
+        "gfmodel": "智谱全新原生多模态模型，深度理解图像与视频，自主完成研究分析、文档制作等复杂任务",
+        "qfmodel": "千问开源权重的多模态 MoE 模型，在能力、延迟与成本间取得出色平衡",
+        "ultimate": "专家级深度推理与思考能力，极致输出质量。",
+        "efficient": "标准推理能力，高性价比",
+        "performance": "高级推理能力，高质量输出",
+        "qmodel_38max": "Qwen 最新基座模型，拥有 2.4T 参数，在软件工程、办公与深度推理方面表现领先",
+        "kmodel_latest": "Kimi 最强模型，拥有 2.8T 参数，专为软件工程、知识工作与深度推理打造",
+        "qmodel_latest": "Agentic 能力的全面跃迁，可自主完成长程复杂任务",
+    },
+    "labels": {
+        "auto": "Auto", "lite": "轻量", "cmodel": "Cantus",
+        "dmodel": "DeepSeek-V4-Pro", "gmodel": "GLM-5.3",
+        # issue #68：上游清单已下发 Kimi-K2.8-Preview，旧 label 钉在 K2.7 会自相矛盾。
+        "kmodel": "Kimi-K2.8-Preview", "mmodel": "MiniMax-M3",
+        "qmodel": "Qwen3.7-Plus", "dfmodel": "DeepSeek-V4-Flash",
+        "gfmodel": "GLM-5.3-Flash", "qfmodel": "Qwen3.8-Flash",
+        "ultimate": "极致", "efficient": "经济", "performance": "性能",
+        "qmodel_38max": "Qwen3.8-Max", "kmodel_latest": "Kimi-K3",
+        "qmodel_latest": "Qwen3.7-Max",
+    },
+}
 
 
 # 国际版未开通套餐时的官方禁用提示（官方桌面版原文）
@@ -1719,22 +1752,61 @@ OFFICIAL_DISABLED_REASON = "需要升级或购买千问官方套餐开放"
 _official_text_cache = {}
 
 
+def _official_text_candidates():
+    """收集 dynamic-text JSON 的候选路径（issue #68）。
+
+    旧实现只扫 Windows 安装目录，Linux / 容器（home=/root）里永远匹配不到，
+    于是静默回退到内嵌快照——快照自 v1.1.0 起没更新过，模型介绍里还写着
+    早已下线的版本号。
+
+    新的查找顺序：
+      1. QD_OFFICIAL_TEXT（文件或目录；显式覆盖，容器部署用这个最可靠）
+      2. 常见挂载目录 /app/assets/dynamic-text、/data/dynamic-text、/config/dynamic-text
+      3. Linux / macOS 客户端位置（~/.config/qoder/...、~/Library/Application Support/...）
+      4. Windows 安装目录（原有路径，保留）
+    """
+    import glob as _glob
+    out = []
+    env = str(os.environ.get("QD_OFFICIAL_TEXT") or "").strip()
+    if env:
+        if os.path.isdir(env):
+            out.extend(sorted(_glob.glob(os.path.join(env, "*.json"))))
+        elif os.path.isfile(env):
+            out.append(env)
+    for base in ("/app/assets/dynamic-text", "/data/dynamic-text",
+                 "/config/dynamic-text"):
+        if os.path.isdir(base):
+            out.extend(sorted(_glob.glob(os.path.join(base, "*.json"))))
+    home = os.path.expanduser("~")
+    basename = os.path.basename(home)
+    for base in (os.path.join(home, ".config", "qoder", "dynamic-text"),
+                 os.path.join(home, "Library", "Application Support",
+                              "Qoder", "dynamic-text")):
+        if os.path.isdir(base):
+            out.extend(sorted(_glob.glob(os.path.join(base, "*.json"))))
+    for drive in ("C", "D", "E", "F"):
+        for prog, fname in (("Qoder CN", "qoder-cn.json"), ("Qoder", "qoder.json")):
+            p = os.path.join(f"{drive}:", "Users", basename, "AppData", "Local",
+                             "Programs", prog, "resources", "dynamic-text", fname)
+            if os.path.isfile(p):
+                out.append(p)
+    seen, uniq = set(), []
+    for p in out:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq
+
+
+_OFFICIAL_TEXT_LOGGED = {"embedded": False}
+
+
 def load_official_text():
     """读取官方客户端 dynamic-text 文案 -> {"descriptions","labels"}（zh）。"""
     global _official_text_cache
     if _official_text_cache:
         return _official_text_cache
-    import os as _os
-    home = _os.path.expanduser("~")
-    basename = _os.path.basename(home)
-    real = []
-    for drive in ("C", "D", "E", "F"):
-        for prog, fname in (("Qoder CN", "qoder-cn.json"), ("Qoder", "qoder.json")):
-            p = _os.path.join(f"{drive}:", "Users", basename, "AppData", "Local",
-                              "Programs", prog, "resources", "dynamic-text", fname)
-            if _os.path.isfile(p):
-                real.append(p)
-    for p in real:
+    for p in _official_text_candidates():
         try:
             flat = {}
 
@@ -1760,6 +1832,12 @@ def load_official_text():
                 return _official_text_cache
         except Exception:
             continue
+    if not _OFFICIAL_TEXT_LOGGED["embedded"]:
+        # issue #68：静默永久回退是最难发现的一类问题——至少让它可见。
+        _OFFICIAL_TEXT_LOGGED["embedded"] = True
+        _warn("official model text: no client dynamic-text found; using the "
+              "EMBEDDED snapshot (may be stale). Set QD_OFFICIAL_TEXT="
+              "/path/to/qoder-cn.json to override.")
     _official_text_cache = dict(_EMBEDDED_MODEL_TEXT)
     return _official_text_cache
 

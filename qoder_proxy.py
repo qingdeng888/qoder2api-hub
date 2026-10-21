@@ -43,6 +43,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import random
 import uuid
 
 import qoder_accounts
@@ -52,12 +53,13 @@ import qoder_catalog
 import qoder_proxypool
 import qoder_settings
 import qoder_sign
+import qoder_updater
 from qoder_sign import qoder_encode, SESSIONS
 from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.5.5"
+VERSION = "1.6.1"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -1266,6 +1268,8 @@ def credits_summary():
     by_realm = {}
     rows = []
     total_remain = 0
+    seen_orgs = set()        # 已计入过共享池的组织（跨账号去重，issue #67）
+    unlimited_orgs = set()   # cap=-1 的组织共享池
     accounts = list(POOL.accounts) if POOL else []
     for a in accounts:
         cred = getattr(a, "credits", None)
@@ -1273,8 +1277,23 @@ def credits_summary():
             cred = {}
         realm = getattr(a, "realm", "") or ""
         remain = cred.get("remain")
-        # issue #39：团队账号的套餐 may 用满而共享池仍有余额——汇总按有效余额，
-        # 同时保留原始 remain 便于核对（两者都会出现在行里）。
+        shared = cred.get("shared") if isinstance(cred.get("shared"), dict) else None
+        # issue #67：共享池是**组织级**资源，同一组织下每个账号的 quota 响应都会
+        # 回显同一份；逐账号累加会把 1,000,000 乘成 4,000,000。这里按
+        # organization_id 去重，没有组织标识的（个人号）才按账号算。
+        org = str(getattr(a, "organization_id", "") or "")
+        org_key = ("org", org) if org else ("uid", getattr(a, "uid", "") or "")
+        unlimited = bool(shared and shared.get("unlimited"))
+        plan_remain = remain if isinstance(remain, (int, float)) \
+            and not isinstance(remain, bool) else 0
+        shared_counted = 0
+        if unlimited:
+            unlimited_orgs.add(org_key)
+        elif shared and shared.get("available", True):
+            if org_key not in seen_orgs:
+                seen_orgs.add(org_key)
+                shared_counted = int(shared.get("remain") or 0)
+        # 行内仍保留账号视角的 effective（套餐+共享），另给 counted 便于核对汇总
         eff = qoder_accounts.effective_remain(cred)
         rows.append({
             "uid": getattr(a, "uid", "") or "",
@@ -1282,19 +1301,23 @@ def credits_summary():
             "realm": realm,
             "credits_remain": remain,
             "credits_remain_effective": eff,
-            "credits_shared_remain": (cred.get("shared") or {}).get("remain")
-            if isinstance(cred.get("shared"), dict) else None,
+            "credits_counted": int(plan_remain) + shared_counted,
+            "credits_org": org,
+            "credits_shared_unlimited": unlimited,
+            "credits_shared_remain": (shared or {}).get("remain"),
             "credits_used": cred.get("used"),
             "credits_size": cred.get("size"),
             # 登记时间：credits.updated_at（fetch_credits 写入），不是文件 mtime。
             "registered_at": cred.get("updated_at"),
         })
-        if isinstance(eff, (int, float)) and not isinstance(eff, bool):
-            by_realm[realm] = by_realm.get(realm, 0) + int(eff)
-            total_remain += int(eff)
+        total = int(plan_remain) + shared_counted
+        by_realm[realm] = by_realm.get(realm, 0) + total
+        total_remain += total
     return {
         "by_realm": by_realm,
-        "totals": {"remain": total_remain, "accounts": len(rows)},
+        "totals": {"remain": total_remain, "accounts": len(rows),
+                   "unlimited_orgs": len(unlimited_orgs),
+                   "shared_deduped": True},
         "accounts": rows,
         "note": _CREDITS_SUMMARY_NOTE,
     }
@@ -2436,9 +2459,53 @@ def read_local_models(realm=None):
                 log("model catalog read from local client cache: %d models (%s)"
                     % (len(out), r))
                 return out
+    except FileNotFoundError:
+        # issue #74 补充：容器 / 未装官方客户端时 ~/.qoder/.models/default 天然
+        # 不存在，这是**正常降级**（最终回落到内嵌快照），不该刷 WARN 让人误判。
+        pass
     except Exception as exc:
-        log("local model catalog read skipped: %s" % exc)
+        log("local model catalog read skipped: %s" % exc, level="DEBUG")
     return []
+
+
+_MODELS_DISK_CACHE_TTL = 7 * 24 * 3600      # 7 天（动态失败时保底，issue #58）
+
+
+def _models_cache_path(realm):
+    """动态模型清单的磁盘缓存路径（issue #58）。"""
+    return os.path.join(ACCOUNTS_DIR, "models-cache-%s.json" % (realm or "cn"))
+
+
+def _save_models_cache(realm, live):
+    """把**动态发现**的模型清单落盘（容器重启/网络抖动后仍能看到新模型）。"""
+    try:
+        rows = [{"key": mid, "meta": meta} for mid, meta in live]
+        blob = {"at": time.time(), "realm": realm or "cn", "models": rows}
+        path = _models_cache_path(realm)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(blob, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as exc:
+        log("models cache write failed: %s" % exc, level="WARN")
+
+
+def _load_models_cache(realm):
+    """读磁盘缓存；过期或损坏返回 []（issue #58）。"""
+    try:
+        path = _models_cache_path(realm)
+        with open(path, encoding="utf-8") as fh:
+            blob = json.load(fh)
+        if time.time() - float(blob.get("at") or 0) > _MODELS_DISK_CACHE_TTL:
+            return []
+        out = []
+        for row in blob.get("models") or []:
+            mid = row.get("key")
+            if mid:
+                out.append((mid, row.get("meta") or {}))
+        return out
+    except Exception:
+        return []
 
 
 def fetch_models(realm=None):
@@ -2449,6 +2516,10 @@ def fetch_models(realm=None):
             return c["data"]
     # 1) 动态接口（需要账号） 2) 本机官方目录缓存 3) 内嵌静态快照
     live = read_dynamic_models(realm=r)
+    if live:
+        _save_models_cache(r, live)      # issue #58：成功的动态清单落盘
+    if not live:
+        live = _load_models_cache(r)     # 动态拿不到时先用上次成功的结果
     if not live:
         live = read_local_models(realm=r)
     entries = merge_catalog(live, realm=r)
@@ -3107,6 +3178,55 @@ def requested_effort(payload):
 
 
 # ---------------------------------------------------------------------------
+# 一键更新（面板按钮 -> 下载 release -> 校验 -> 备份 -> 替换 -> 自动重启）
+# ---------------------------------------------------------------------------
+_LAUNCH_ARGV = list(sys.argv)          # 更新后按原参数重启
+APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+UPDATE_DISABLED = str(os.environ.get("QD_UPDATE_DISABLE") or "").strip().lower() \
+    in ("1", "on", "true", "yes", "enable", "enabled")
+_UPDATE_LOCK = threading.Lock()
+
+
+def _update_allow_remote():
+    return str(os.environ.get("QD_UPDATE_ALLOW_REMOTE") or "").strip().lower() \
+        in ("1", "on", "true", "yes", "enable", "enabled")
+
+
+def _is_loopback(host):
+    host = str(host or "")
+    return host in ("::1", "localhost") or host.startswith("127.") \
+        or host.startswith("::ffff:127.")
+
+
+def update_plan_info():
+    """一键更新的预检信息（不下载、不改文件）。"""
+    cur = VERSION
+    latest = ""
+    err = ""
+    try:
+        latest = qoder_updater.latest_release().get("version") or ""
+    except Exception as exc:
+        err = str(exc)[:160]
+    has = bool(latest) and version_tuple(latest) > version_tuple(cur)
+    return {
+        "ok": True,
+        "current": cur,
+        "latest": latest,
+        "has_update": has,
+        "container": qoder_updater._in_container(),
+        "disabled": UPDATE_DISABLED,
+        "can_apply": bool(has) and not UPDATE_DISABLED,
+        "state": qoder_updater.state(),
+        "error": err,
+    }
+
+
+def apply_update_now(tag=None):
+    """执行更新（阻塞）；成功后调用方负责触发重启。"""
+    with _UPDATE_LOCK:
+        return qoder_updater.apply_update(APP_ROOT, tag=tag)
+
+# ---------------------------------------------------------------------------
 # 项目新版本检测（对比 GitHub 最新 release；结果缓存 6 小时）
 # ---------------------------------------------------------------------------
 UPDATE_CHECK_URL = ("https://api.github.com/repos/shuishuipingan/"
@@ -3271,6 +3391,12 @@ def normalize_tools(obj):
     for t in tools:
         if not isinstance(t, dict):
             continue
+        _kind2 = t.get("type")
+        if _kind2 not in (None, "function"):
+            # issue #63：namespace / web_search 等类型 Qoder 无法表达，
+            # 透传会导致上游 400（unknown variant）。丢弃并告警。
+            _log_unsupported_tool(_kind2, "chat-tools")
+            continue
         if "name" in t and "function" not in t and t.get("type") == "function":
             fn = {
                 "name": t.get("name") or "",
@@ -3364,6 +3490,42 @@ LEAK_MARKER = "[assistant 请求调用工具]"
 # with ANGLE brackets (<assistant 请求调用工具>). Normalize it to the square-bracket
 # form at every entry so there is exactly one code path for detection.
 LEAK_MARKER_ALT = "<assistant 请求调用工具>"
+# issue #60 follow-up：模型复述时还会把括号写成 `[<assistant 请求调用工具]`、
+# 或丢掉尾括号 `[<assistant 请求调用工具`。这里用一条正则统一识别所有变体，
+# 避免每出现一种就补一个常量。
+_LEAK_MARKER_RE = re.compile(
+    r"[\[<(]*\s*assistant\s*请求调用工具\s*[\]>)]?")
+
+_MARKER_CORE = "assistant请求调用工具"
+# 只匹配「开头」部分（前导括号 + assistant + 文案），不含尾括号。
+_MARKER_OPEN_RE = re.compile(r"^[\[<(]*\s*assistant\s*请求调用工具")
+_MARKER_OPEN_CANON = "[assistant 请求调用工具"
+
+
+def _marker_key(text):
+    """去掉空白后的 marker 主体（用于前缀判定）。"""
+    return (text or "").replace(" ", "").replace("\u3000", "")
+
+
+def _marker_prefix_ok(text):
+    """text 是否是某个 marker 变体的**前半截**（跨帧/截断用）。"""
+    raw = (text or "").lstrip()
+    body = raw.lstrip("[<")
+    key = _marker_key(body)
+    if not key:
+        return raw.strip() in ("", "[", "<", "[<")
+    return _MARKER_CORE.startswith(key)
+
+
+def _last_marker_span(text):
+    """返回最后一个 marker 变体的 (start, end)；没有则 (-1, -1)。"""
+    last = (-1, -1)
+    for m in _LEAK_MARKER_RE.finditer(text or ""):
+        last = (m.start(), m.end())
+    return last
+
+
+
 
 
 def _normalize_leak_marker(text):
@@ -3377,8 +3539,14 @@ def _normalize_leak_marker(text):
         return text
     t = text.lstrip()
     lead = text[:len(text) - len(t)]
-    if t.startswith(LEAK_MARKER_ALT):
-        return lead + LEAK_MARKER + t[len(LEAK_MARKER_ALT):]
+    # issue #60 follow-up：只把**开头**归一成规范形态，尾括号（或缺失）
+    # 原样保留——否则给本来没写 ] 的片段补一个，跨帧拼接后会多出一个字符。
+    m = _LEAK_MARKER_RE.match(t)
+    if m:
+        # 只归一**已存在**的括号：原本没写尾括号就不补（否则跨帧拼接多一个字符）；
+        # 写了 > / ) / ] 则统一成 ]，保持「一个 marker 只有一个闭括号」。
+        _close = "]" if m.group(0).rstrip()[-1:] in ("]", ">", ")") else ""
+        return lead + _MARKER_OPEN_CANON + _close + t[m.end():]
     if t.startswith("```"):
         rest = t[3:]
         low = rest.lstrip().lower()
@@ -3386,9 +3554,10 @@ def _normalize_leak_marker(text):
             after = rest.lstrip()[4:].lstrip()
         else:
             after = rest.lstrip()
-        if after.startswith(LEAK_MARKER_ALT):
+        m2 = _LEAK_MARKER_RE.match(after)
+        if m2:
             return (lead + t[:len(t) - len(after)]
-                    + LEAK_MARKER + after[len(LEAK_MARKER_ALT):])
+                    + LEAK_MARKER + after[m2.end():])
     return text
 
 
@@ -3483,6 +3652,39 @@ def _log_unrecovered_leak(text, where="chat"):
         pass
 
 
+EMPTY_ECHO_ERROR_DETAIL = (
+    "upstream returned only a truncated tool-call echo (no usable call); "
+    "the turn was failed on purpose so the client retries instead of "
+    "silently treating the task as finished (issue #72)"
+)
+
+
+def _echo_names_declared(text, allowed_names):
+    """回声里出现的工具名**全部**在本次声明集合里（issue #72 收紧判据）。
+
+    只按「声明了 tools」就 fail-closed 太宽：模型复述**未声明**工具时我们本来就
+    恢复不了（#27），把它判成失败会误伤一批正常回合。
+    """
+    if not allowed_names:
+        return False
+    names = re.findall(r'"name"\s*:\s*"([^"]{1,120})"', str(text or ""))
+    if not names:
+        return False
+    return all(n in allowed_names for n in names)
+
+
+def _marker_only_echo(text):
+    """整段除了泄漏标记之外什么都没有（issue #72 的退化形态）。"""
+    if not str(text or "").strip():
+        return False
+    t = _normalize_leak_marker(str(text or "").strip())
+    rest = t
+    while rest.startswith(LEAK_MARKER):
+        rest = rest[len(LEAK_MARKER):].lstrip()
+    rest = _strip_dsml_close_tail(rest).strip()
+    return rest == ""
+
+
 class InvalidToolArguments(UpstreamStatus):
     """已确认是工具协议回声，但内层 arguments 不是合法 JSON（issue #37）。
 
@@ -3498,6 +3700,20 @@ class InvalidToolArguments(UpstreamStatus):
 
     def __init__(self):
         super(InvalidToolArguments, self).__init__(502, BAD_ARGS_ERROR_DETAIL)
+
+
+class EmptyToolEcho(InvalidToolArguments):
+    """模型本轮只吐了工具协议回声、没有可用调用（issue #72）。
+
+    继承 InvalidToolArguments：四条协议出口（chat 流式 / Responses / Anthropic /
+    非流式 502）已经统一按 fail-closed 处理，重试与账号冷却入口也显式排除。
+    区别只是错误文案——告诉客户端「这是残缺回声，请重试」，而不是让它误判完成。
+    """
+
+    def __init__(self, chars=0, kind="marker_only"):
+        UpstreamStatus.__init__(
+            self, 502, "%s [%d chars, %s]" % (EMPTY_ECHO_ERROR_DETAIL,
+                                             int(chars), kind))
 
 
 _JSON_FENCE = chr(96) * 3
@@ -3607,6 +3823,42 @@ _HOLD_MAX_CHARS = 32768            # 32KB（真实回声块远小于此；见档
 _HOLD_MAX_FRAMES = 200             # 连续空转帧上限（帧不增长才算一帧）
 
 
+_ECHO_LOOSE_RE = re.compile(
+    r'^\[\s*\{\s*"name"\s*:\s*"([^"]{1,200})"\s*,\s*"arguments"\s*:\s*"(.*)"\s*\}\s*\]$',
+    re.DOTALL)
+
+
+def _repair_json_quotes(text):
+    """把「内层未转义的双引号」补上转义（issue #60）。
+
+    模型会写出 `"arguments": "{"filename":"a.png"}"` —— 内部引号没转义，
+    连外层数组都不是合法 JSON。这里先把已转义的占位，再把裸引号转义，复原。
+    """
+    ph = "\x00"
+    s = (text or "").replace('\\"', ph)
+    s = s.replace('"', '\\"')
+    return s.replace(ph, '\\"')
+
+
+def _salvage_echo_array(rest):
+    """宽松重建「[{"name":…,"arguments":"<未转义 JSON>"}]」（issue #60）。
+
+    严格 json.loads 失败时才调用；只处理**单调用**形态（模型复述几乎都是单调用），
+    重建后再交给调用方做同一套严格校验（name 命中声明、arguments 合法）。
+    """
+    m = _ECHO_LOOSE_RE.match((rest or "").strip())
+    if not m:
+        return None
+    name, raw_args = m.group(1), m.group(2)
+    for cand in (raw_args, _repair_json_quotes(raw_args)):
+        try:
+            json.loads(cand)
+            return [{"name": name, "arguments": cand}]
+        except Exception:
+            continue
+    return None
+
+
 def parse_leaked_tool_calls(text, allowed_names=None):
     """把模型复述的「marker + JSON 数组」还原成结构化 tool_calls。
 
@@ -3635,24 +3887,25 @@ def parse_leaked_tool_calls(text, allowed_names=None):
     # issue #51：截图里出现「闭标签 + 数组」（无 marker）与「marker + 杂字 + 数组」。
     # 先剥掉前导的 DSML 闭合标签，再决定起点。
     t = re.sub(r"^(?:\s*</[^>]*DSML[^>]*>)+", "", t).strip()
-    _mpos = t.rfind(LEAK_MARKER)
+    # issue #60 follow-up：marker 可能写成 [<assistant …] / 尾括号缺失，
+    # 用正则取**最后一个**变体，避免每出现一种括号组合就漏一次。
+    _mpos, _mend = _last_marker_span(t)
     if _mpos < 0:
         # 无 marker：允许「整段就是 [{name, arguments}] 数组」（严格校验仍在下面）
         if t.startswith("["):
-            _mpos = 0
             t = LEAK_MARKER + chr(10) + t     # 复用同一套解析路径
+            _mpos, _mend = 0, len(LEAK_MARKER)
         else:
             return None, text
-    prefix = t[:_mpos]
-    # 前缀尾部可能残留 marker（「散文 + marker1 + marker2 + 数组」时，
-    # marker1 落在 prefix 里）——它绝不能当正文发给客户端。
-    prefix = prefix.rstrip()
-    for _mk in (LEAK_MARKER, LEAK_MARKER_ALT):
-        while prefix.endswith(_mk):
-            prefix = prefix[:-len(_mk)].rstrip()
-    t = t[_mpos:]
-    while t.startswith(LEAK_MARKER):
-        t = t[len(LEAK_MARKER):].lstrip()
+    # 前缀里残留的任何 marker 变体都不能当正文发给客户端。
+    prefix = _LEAK_MARKER_RE.sub("", t[:_mpos]).rstrip()
+    t = t[_mend:]
+    while True:
+        _m = _LEAK_MARKER_RE.match(t.lstrip())
+        if not _m:
+            break
+        t = t.lstrip()[_m.end():]
+    t = t.lstrip()
     t = _strip_dsml_close_tail(t)
     if t.endswith(_JSON_FENCE) and len(t) > len(_JSON_FENCE):
         t = _strip_dsml_close_tail(t[:-len(_JSON_FENCE)].rstrip())
@@ -3674,7 +3927,10 @@ def parse_leaked_tool_calls(text, allowed_names=None):
     try:
         arr = json.loads(rest)
     except Exception:
-        return None, text
+        # issue #60：内层引号未转义时外层也非法——按单调用形态抢救一次
+        arr = _salvage_echo_array(rest)
+        if arr is None:
+            return None, text
     if not isinstance(arr, list) or not arr:
         return None, text
     calls = []
@@ -3715,21 +3971,23 @@ def _leak_body_offset(text):
     t = _normalize_leak_marker((text or "")).lstrip()
     if not t or LEAK_MARKER.startswith(t):
         return "pre", None
-    if t.startswith(LEAK_MARKER):
+    _m = _LEAK_MARKER_RE.match(t)
+    if _m:
         # issue #49：模型会连写两个 marker（数组在第二个之后）——跳过重复的，
         # 否则 hold 会被判成「body 不是数组」而在流式中途证伪、整块补发。
-        body = t[len(LEAK_MARKER):]
-        b = body.lstrip()
-        while b.startswith(LEAK_MARKER):
-            b = b[len(LEAK_MARKER):].lstrip()
-        # 重复 marker 还没打完（跨帧，如 "[assista"）——仍算候选，内容留空等下一帧。
-        # 不回 "pre" 是因为此处已越过首个 marker，语义上是 body 但"暂时没内容"。
-        if b and (LEAK_MARKER.startswith(b) or LEAK_MARKER_ALT.startswith(b)):
+        b = t[_m.end():].lstrip()
+        while True:
+            _m2 = _LEAK_MARKER_RE.match(b)
+            if not _m2:
+                break
+            b = b[_m2.end():].lstrip()
+        # 重复 marker 还没打完（跨帧）——仍算候选，内容留空等下一帧。
+        if b and _marker_prefix_ok(b):
             return "body", ""
         return "body", b
-    # issue #36 后续：尖括号变体的**真前缀**（跨帧进行中）同样算 pre——
-    # 1 字符/帧时 '<' 单独到达，不能当散文放出（否则 marker 开头丢失）。
-    if LEAK_MARKER_ALT.startswith(t):
+    # issue #60 follow-up：任意括号组合的**真前缀**（跨帧进行中）同样算 pre——
+    # 1 字符/帧时 '[' 或 '<' 单独到达，不能当散文放出（否则 marker 开头丢失）。
+    if _marker_prefix_ok(t):
         return "pre", None
     if not t.startswith("`"):
         return "no", None
@@ -3801,6 +4059,13 @@ def _json_array_prefix_ok(text):
             # 为稳妥两种位置都检查。
             return (s[max(0, pos - 1):pos + 1] == "\\u"
                     or s[pos:pos + 2] == "\\u")
+        # issue #60: 内层 arguments 的引号未转义时，json 会在数组中途报
+        # "Expecting , delimiter" / "Expecting property name"。这不是截断，
+        # 而是要靠流末 salvage 重建——继续 hold，别中途证伪漏成正文。
+        if ("arguments" in s and (
+                msg.startswith("Expecting ',' delimiter")
+                or msg.startswith("Expecting property name"))):
+            return True
         if msg.startswith("Extra data"):
             # 数组已完整，尾随的只能是（可能还没打完的）``` 收尾围栏
             tail = s[pos:].strip()
@@ -3839,19 +4104,23 @@ def _find_marker_split(text, allow_prefix=True):
     if not t:
         return "", ""
     best = -1
-    for mk in (LEAK_MARKER, TOOL_RESULT_MARKER):
-        i = t.find(mk)
-        if i != -1 and (best == -1 or i < best):
-            best = i
+    # issue #60 follow-up：任意括号变体（[<assistant …] / 尾括号缺失）都要能切开，
+    # 否则「散文 + marker」同帧到达时整块被当正文发出去。
+    _m = _LEAK_MARKER_RE.search(t)
+    if _m:
+        best = _m.start()
+    i = t.find(TOOL_RESULT_MARKER)
+    if i != -1 and (best == -1 or i < best):
+        best = i
     if best != -1:
         return t[:best], t[best:]
     if not allow_prefix:
         return t, ""
     tail = t[-_MARKER_HOLD_WINDOW:] if len(t) > _MARKER_HOLD_WINDOW else t
-    for mk in (LEAK_MARKER, LEAK_MARKER_ALT, TOOL_RESULT_MARKER):
-        for n in range(min(len(tail), len(mk) - 1), 0, -1):
-            if tail.endswith(mk[:n]):
-                return t[:-n], t[-n:]
+    for n in range(len(tail), 0, -1):
+        seg = tail[-n:]
+        if _marker_prefix_ok(seg) or TOOL_RESULT_MARKER.startswith(seg):
+            return t[:-n], t[-n:]
     return t, ""
 
 
@@ -3859,6 +4128,10 @@ def _marker_starts_at(text):
     """text 是否以某标记开头，或整段就是它的真前缀（跨帧补全中）。"""
     t = text or ""
     if not t:
+        return True
+    # issue #60 follow-up：括号变体（[<assistant …] / 缺尾括号）同样算命中；
+    # 单靠 startswith(常量) 会让大块开头的变体直接漏出去。
+    if _LEAK_MARKER_RE.match(t) or _marker_prefix_ok(t):
         return True
     for mk in (LEAK_MARKER, LEAK_MARKER_ALT, TOOL_RESULT_MARKER):
         if t.startswith(mk):
@@ -3881,7 +4154,8 @@ def _still_leak_candidate(text):
     # issue #51：marker 之后可能先跟一小段杂字（">、=、: 等）再进数组，
     # 且数组开头的 [ 可能丢了（直接 {"name":...}）。两种都保持候选，
     # 由流末 parse（含补括号启发式）决定成败。
-    _trimmed = rest.lstrip(chr(34) + chr(39) + ">=: ").lstrip()
+    # issue #60 follow-up：marker 变体可能多带一个 ]（[assistant …]]），也算杂字。
+    _trimmed = rest.lstrip(chr(34) + chr(39) + ">=: ]").lstrip()
     if not _trimmed:
         return True          # 目前全是杂字（还没进数组）：继续等
     if _trimmed[0] in "[{":
@@ -4215,6 +4489,22 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
             # 当正文补发——直接升级为协议错误（提前判定，不等流末）。
             if _echo_with_bad_args(hold, allowed_names):
                 raise InvalidToolArguments()
+            # issue #60 follow-up：散文 + marker 落在同一个大块时，hold 以散文开头
+            # 会直接证伪——整块（含协议正文）被当正文补发。这里先把散文前缀放行，
+            # 只保留 marker 起的部分继续判候选。
+            _last_m = None
+            for _mm in _LEAK_MARKER_RE.finditer(hold or ""):
+                _last_m = _mm
+            if _last_m is not None and _last_m.start() > 0:
+                _tail60 = hold[_last_m.start():]
+                if _still_leak_candidate(_tail60):
+                    _prose60 = hold[:_last_m.start()]
+                    if _prose60.strip():
+                        yield _leak_chunk_frame(meta, {"content": _prose60})
+                    hold = _tail60
+                    if fin:
+                        finished = (_frame_without_content(payload), fin)
+                    continue
             # issue #49 方向 C：候选被证伪 -> 整段当正文补发，这里同样留痕
             # （形态3「marker + <terminal></terminal> 空壳」就走这条：没有 JSON
             # 可恢复，但必须让发生率可见，而不是静默失真）。
@@ -4289,8 +4579,17 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
                 level="WARN", tag="chat")
             raise InvalidToolArguments()
         elif _leaked_partial_droppable(hold, allowed_names):
-            # issue #9：截断的 marker+JSON 回声无法还原成结构化调用，吞掉整段，
-            # 绝不把网关内部协议文本透传给终端用户。
+            # issue #72：**不要把「残缺工具回声」当成功结束**。此前吞掉后按
+            # stop 收尾，coding agent 会认为任务做完了（静默中断，比报错更难查）。
+            # 客户端声明了 tools 且本轮没有一个可用调用 -> fail-closed，让客户端重试。
+            if allowed_names and _marker_only_echo(hold):
+                _kind = "marker_only" if _marker_only_echo(hold) else "partial_array"
+                log("dropped truncated leaked tool-call echo (%d chars, %s, "
+                    "tools_declared=%d) — failing the turn closed (issue #72)"
+                    % (len(hold), _kind, len(allowed_names)),
+                    level="WARN", tag="chat")
+                raise EmptyToolEcho(len(hold), _kind)
+            # issue #9：未声明工具时仍按原样吞掉（无可恢复的调用可言）
             log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
                 % len(hold), level="WARN", tag="chat")
         elif _tool_echo_droppable(hold, allowed_names):
@@ -4298,6 +4597,11 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
             # 未闭合的截断块）——吞掉，不还原（需 tool_call_id 配对）。
             log("dropped leaked tool-result echo (%d chars) — issue #11"
                 % len(hold), level="WARN", tag="chat")
+        elif _marker_only_echo(hold):
+            # 只有标记、没有任何内容：无论如何都不该透传给终端用户
+            # （未声明 tools 时无法确认是回声，但「一个孤零零的标记」没有信息量）。
+            log("dropped bare tool-call marker (%d chars) — issue #72" % len(hold),
+                level="WARN", tag="chat")
         else:
             # issue #49 方向 C：认不出但**看起来就是协议回声**的，必须留痕。
             _log_unrecovered_leak(hold, "stream")
@@ -4627,7 +4931,10 @@ def _current_turn_start(messages):
 # Anthropic 入口，1,283 次工具调用 0 降级；同环境开启前基线 0.30%）。
 # 结构化直传后模型看不到 LEAK_MARKER 文本格式，也就无从复述——这是治本项。
 # _tool_ids_ok 守卫仍在：客户端 id 不齐备时自动回退文本化，不会踩坑。
-STRUCTURED_TOOL_HISTORY_WHITELIST = ("qwen", "glm", "gm4", "gm5", "deepseek")
+# issue #60 follow-up：DeepSeek 的**上游 key 是 `dfmodel`**（显示名 DeepSeek-V4-Flash），
+# 只写 "deepseek" 匹配不到 -> auto 一直是文本化，模型照抄伪协议。两个都保留。
+STRUCTURED_TOOL_HISTORY_WHITELIST = ("qwen", "glm", "gm4", "gm5",
+                                   "deepseek", "dfmodel")
 _STRUCTURED_LOG_ONCE = {"done": False}
 
 
@@ -4816,6 +5123,18 @@ def flatten_messages(messages, keep_reasoning=False, structured=False):
     return system_text, flat, images
 
 
+# issue #59：出站体积前置限制。阿里云 SLB 对单个 POST body 有 30MB 硬限制，
+# 超过会直接 RST（本地表现为 Broken pipe），而 Broken pipe 会被当成瞬态故障
+# 反复重试、最终把整个账号池打到熔断。留 1MB 余量。
+MAX_UPSTREAM_BODY_BYTES = int(float(os.environ.get("QD_MAX_BODY_MB") or 29)
+                               * 1024 * 1024)
+
+
+def _keep_toplevel_images():
+    """是否保留顶层冗余图片字段（默认否，issue #59）。"""
+    return str(os.environ.get("QD_KEEP_TOPLEVEL_IMAGES") or "").strip().lower()         in ("1", "on", "true", "yes")
+
+
 def build_qoder_body(payload, account, model_key, realm=None):
     """构造 agent_chat_generation 上游请求体（返回 dict，随后 qoder_encode）。
 
@@ -4916,7 +5235,11 @@ def build_qoder_body(payload, account, model_key, realm=None):
     extra["originalContent"] = oc
     extra["modelConfig"] = dict(mc)
     cc["extra"] = extra
-    if images:
+    if images and _keep_toplevel_images():
+        # issue #59：上游**只读** messages 里的结构化 image_url parts（v1.4.2 实测），
+        # 顶层这两份是纯冗余：10 张图 15MB -> 出站 48MB -> qoder_encode 后 ~64MB，
+        # 撞上阿里云 SLB 30MB 限制被 RST（Broken pipe），还会把账号池打到熔断。
+        # 默认不再填充；QD_KEEP_TOPLEVEL_IMAGES=1 可恢复旧行为（仅排查用）。
         cc["imageUrls"] = images
         body["image_urls"] = images
     body["chat_context"] = cc
@@ -5088,9 +5411,42 @@ TRANSIENT_MAX_RETRIES = 2          # 同账号额外重试次数（1s、2s 退�
 # 它当成请求被拒（直接结束本轮）。三档都是可调的，默认值保守：
 #   单轮最长等 QUEUE_WAIT_MAX_SECS；整次请求总预算 QUEUE_WAIT_BUDGET_SECS；
 #   最多等 QUEUE_MAX_ROUNDS 轮。超出预算仍按原错误返回（fail-open 语义不变）。
+# issue #57 后续（逆向官方客户端）：官方排队是**独立轮询协议**，总等待默认 60 分钟
+# （QODER_MODEL_QUEUE_MAX_WAIT_MS=3600000），每轮 sleep retryAfterSeconds。
+# 网关是同步 HTTP，不能真等 60 分钟；这里给分钟级预算（默认 10 分钟 / 6 轮），
+# 仍可用 QD_QUEUE_* 覆盖。
 QUEUE_MAX_ROUNDS = int(os.environ.get("QD_QUEUE_MAX_ROUNDS") or 3)
 QUEUE_WAIT_MAX_SECS = int(os.environ.get("QD_QUEUE_WAIT_MAX_SECS") or 180)
-QUEUE_WAIT_BUDGET_SECS = int(os.environ.get("QD_QUEUE_WAIT_BUDGET_SECS") or 300)
+QUEUE_WAIT_BUDGET_SECS = int(os.environ.get("QD_QUEUE_WAIT_BUDGET_SECS") or 600)
+QUEUE_WAIT_JITTER_SECS = float(os.environ.get("QD_QUEUE_WAIT_JITTER") or 2.0)
+
+
+# issue #64：风控/排队信号计数（只读观测，供 /health 与面板排查）。
+RISK_STATS = {"queue": 0, "rate": 0, "rejected": 0, "version_gate": 0,
+              "last": None}
+_RISK_LOCK = threading.Lock()
+
+
+def note_risk(kind, detail=""):
+    """记一次风控/排队信号（queue/rate/rejected/version_gate）。"""
+    try:
+        with _RISK_LOCK:
+            if kind in RISK_STATS:
+                RISK_STATS[kind] = int(RISK_STATS[kind]) + 1
+            RISK_STATS["last"] = {
+                "kind": kind,
+                "at": time.strftime("%m-%d %H:%M:%S"),
+                "detail": str(detail or "")[:120],
+            }
+    except Exception:
+        pass
+
+
+def risk_snapshot():
+    """给 /health 用的快照（不阻塞、不含凭证）。"""
+    with _RISK_LOCK:
+        return {k: (dict(v) if isinstance(v, dict) else v)
+                for k, v in RISK_STATS.items()}
 
 
 def _queue_wait_seconds(detail):
@@ -5279,6 +5635,19 @@ def should_auto_disable_403(detail, model=None):
     return True, "免费模型被拒绝（403）"
 
 
+# 请求自身的确定性错误（issue #59 跟进）：换号也是同一个请求体，结果不会变。
+# 刻意不含 authentication_error / permission_error——那两类可能是账号级问题
+# （凭证失效/无权限），换号有意义，仍走冷却轮换。
+_REQUEST_FAULT_MARKERS = ("invalid_parameter_error", "invalid_request_error",
+                          '"Range of ') + _CONTENT_POLICY_MARKERS
+
+
+def _is_request_fault(code, detail):
+    """请求自身的确定性错误（413 出站超限/参数非法/内容审核）：换号不改变结果。"""
+    return code == 413 or any(m in (detail or "")
+                              for m in _REQUEST_FAULT_MARKERS)
+
+
 def _is_transient_upstream(code, detail):
     """判断一次上游 HTTP 错误是否属于瞬时故障（可重试）。
 
@@ -5317,6 +5686,59 @@ def _is_transient_transport(exc):
     return False
 
 
+# issue #64：容器运行时的自检项。COSY 签名带时间戳，容器时钟漂移会直接 401，
+# 这是「容器里莫名失效」的常见原因之一，必须在启动时看得见。
+_CLOCK_SKEW = {"seconds": None, "checked_at": 0.0}
+
+
+def _measure_clock_skew(timeout=4.0):
+    """用上游 Date 头测时钟漂移（无鉴权、只发 HEAD，结果缓存 10 分钟）。"""
+    now = time.time()
+    if _CLOCK_SKEW["seconds"] is not None and now - _CLOCK_SKEW["checked_at"] < 600:
+        return _CLOCK_SKEW["seconds"]
+    # 走 qoder_accounts 的代理感知 opener（#27：代理只认环境变量，且每请求现建），
+    # 不在这里直连——否则容器里设了 HTTPS_PROXY 也测不准、还破坏出站基线。
+    try:
+        skew = qoder_accounts.upstream_clock_skew(timeout=timeout)
+        if skew is None:
+            return None
+        _CLOCK_SKEW.update({"seconds": skew, "checked_at": now})
+        return skew
+    except Exception:
+        return None
+
+
+def env_report():
+    """容器/部署环境自检（给启动日志与 /health 用，不含凭证）。"""
+    try:
+        writable = os.access(ACCOUNTS_DIR, os.W_OK)
+    except Exception:
+        writable = False
+    ident = os.path.join(ACCOUNTS_DIR, "machine_identity.json")
+    return {
+        "container": _in_container(),
+        "proxy": bool(os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+                      or os.environ.get("https_proxy") or os.environ.get("http_proxy")),
+        "accounts_writable": bool(writable),
+        "identity_cached": os.path.exists(ident),
+        "clock_skew_s": _CLOCK_SKEW["seconds"],
+        "traffic_guard": _traffic_guard_mode() or "auto",
+    }
+
+
+def _in_container():
+    """是否跑在容器里（issue #57 的风控告警用，判定保守）。"""
+    try:
+        if os.path.exists("/.dockerenv"):
+            return True
+        with open("/proc/1/cgroup", encoding="utf-8", errors="ignore") as fh:
+            blob = fh.read()
+        return ("docker" in blob) or ("containerd" in blob) \
+            or ("kubepods" in blob)
+    except Exception:
+        return False
+
+
 def _friendly_net_error(exc, target=""):
     """把 urlopen/连接类异常翻成可操作的中文（issue #52）。
 
@@ -5353,6 +5775,15 @@ def friendly_upstream_error(code, detail):
         code_i = int(code)
     except Exception:
         code_i = 502
+    # issue #64：版本过低是硬门控（官方客户端会自己升级，网关只能提示）
+    if "430" in str(code):
+        return ("客户端/网关版本过低（430）：上游要求升级后才能继续。"
+                "请升级到最新版；这不是账号或网络问题。", "version_too_low")
+    # issue #59：出站体积超限（本地拦下，没发出去）
+    if "payload too large" in detail:
+        return ("请求体过大（超过上游 30MB 限制）：网关已在本地拦下、未发送。"
+                "请减少图片数量/尺寸（或改用更小的图）后重试。详情：%s"
+                % detail[:160], "payload_too_large")
     # issue #38/#51：上游排队 / 资源不足（10605 RESOURCE_LIMIT）
     if "10605" in detail or "isQueued" in detail or "RESOURCE_LIMIT" in detail:
         return ("上游排队中（10605 / RESOURCE_LIMIT）：已按 retryAfterSeconds 等待并重试，"
@@ -5404,6 +5835,16 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
         return
     status_int = _to_int_status(getattr(exc, "status", 502))
     detail = getattr(exc, "detail", "") or ""
+    # issue #71：排队**不是账号问题**——必须在解绑会话/冷却之前短路，
+    # 否则单号池会被打成「no usable account」，面板看起来就是凭证失效。
+    _is_queue71 = ("10605" in detail or "isQueued" in detail)
+    if _is_queue71 and status_int in (401, 403) \
+            and not qoder_accounts.session_dead(detail):
+        note_risk("queue", detail)
+        log("account %s queued via envelope (HTTP %s) - not penalising the "
+            "account (issue #71)" % (account.uid[:8], status_int),
+            level="WARN", tag="chat")
+        return
     if session_key and POOL:
         try:
             POOL.affinity.unbind(session_key)
@@ -5441,7 +5882,8 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
             return
         # 10605 排队冷却为模型级或账号级
         is_queue = is_queue_403(detail)
-        cd = 300 if dead else (retry_secs if is_queue else 60)
+        note_risk("queue" if is_queue else "rejected", detail)
+        cd = 300 if dead else 60
         actual = account.note_error("envelope HTTP %s: %s"
                                     % (status_int, detail[:80]),
                                     cooldown=cd, single_account=(total <= 1),
@@ -5481,6 +5923,58 @@ def set_diag_request(flag):
 
 def is_diag_request():
     return bool(getattr(_DIAG_LOCAL, "diag", False))
+
+
+def _alt_realm_ready(realm, model=""):
+    """另一个区是否还有可用账号（issue #71 跨区 failover 用）。"""
+    other = "intl" if realm == "cn" else "cn"
+    try:
+        return other if _realm_ready_total(other, model) > 0 else ""
+    except Exception:
+        return ""
+
+
+def _envelope_queue_action(exc, realm, model, state):
+    """排队信封的下一步（issue #71）：failover / wait / giveup。
+
+    返回 (action, target_realm, wait_secs)。state 是每个请求一份的字典：
+    {rounds, deadline, switched}。三条规则：
+      1. 另一区有就绪账号 -> 先跨区试一次（排队是区域+模型维度，本次现场就是
+         cn 排队而 intl 同模型 200）；
+      2. 否则按 retryAfterSeconds 等，但总轮次/总时长受请求级预算约束；
+      3. 预算耗尽 -> giveup，由调用方转成 429 + Retry-After（不是 403）。
+    """
+    q = _envelope_queue_wait(exc)
+    if q <= 0:
+        return "wait", "", 0
+    if not state.get("switched"):
+        alt = _alt_realm_ready(realm, model)
+        if alt:
+            state["switched"] = True
+            return "failover", alt, 0
+    state["rounds"] = int(state.get("rounds") or 0) + 1
+    if state["rounds"] > QUEUE_MAX_ROUNDS \
+            or time.time() > float(state.get("deadline") or 0):
+        return "giveup", "", q
+    if q > QUEUE_WAIT_MAX_SECS:
+        return "giveup", "", q
+    return "wait", "", min(q + 1, QUEUE_WAIT_MAX_SECS)
+
+
+def _as_rate_limited_for_queue(exc, model=""):
+    """排队类信封错误 -> RateLimited（429 + Retry-After）；其它原样返回。
+
+    issue #71：排队最终以 403 抛给客户端，很容易被当成凭证失效。
+    """
+    q = _envelope_queue_wait(exc) if exc is not None else 0
+    if q <= 0:
+        return exc
+    return RateLimited(None, getattr(exc, "detail", "") or "", wait=q)
+
+
+def _queue_budget():
+    """日志里显示的「本轮上限」：排队按 QUEUE_MAX_ROUNDS，其余按瞬时重试数。"""
+    return max(TRANSIENT_MAX_RETRIES + 1, QUEUE_MAX_ROUNDS)
 
 
 def _envelope_queue_wait(exc):
@@ -5557,11 +6051,12 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
             except UpstreamStatus as exc:
                 _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
                 if not should_retry_envelope(exc, False, attempt):
-                    raise
+                    # issue #71：排队耗尽 -> 429 + Retry-After（不是 403）
+                    raise _as_rate_limited_for_queue(exc, model)
                 log("in-stream envelope status %s on model '%s' "
                     "(try %d/%d), reopening upstream"
-                    % (exc.status, model, attempt + 1,
-                       TRANSIENT_MAX_RETRIES + 1), level="WARN", tag="chat")
+                    % (exc.status, model, min(attempt + 1, _queue_budget()),
+                       _queue_budget()), level="WARN", tag="chat")
                 time.sleep(_envelope_retry_wait(exc, attempt + 1))
                 try:
                     new_resp, account, _ = open_upstream(
@@ -5569,7 +6064,8 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
                 except Exception as reopen_exc:
                     log("reopen after envelope error failed: %s"
                         % str(reopen_exc)[:160], level="WARN", tag="chat")
-                    raise exc      # 以原信封错误进入既有处理路径
+                    # 以原信封错误进入既有处理路径（排队则转 429，issue #71）
+                    raise _as_rate_limited_for_queue(exc, model)
                 if cur is not resp:
                     try:
                         cur.close()
@@ -5606,6 +6102,213 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
                 pass
 
 
+class PayloadTooLarge(UpstreamStatus):
+    """出站请求体超过上游 SLB 限制（issue #59）。
+
+    阿里云 SLB 对单个 POST body 有 30MB 硬限制，超过直接 RST（本地表现为
+    Broken pipe）。必须**在发网络请求前**拦住：Broken pipe 会被 _is_transient_transport
+    当成瞬态故障反复重试，最终把账号池打到熔断（报告者的连锁故障）。
+    """
+
+    def __init__(self, size, limit):
+        super(PayloadTooLarge, self).__init__(
+            413,
+            "payload too large: %d bytes > %d limit; the request was not sent"
+            % (int(size), int(limit)))
+        self.size = int(size)
+        self.limit = int(limit)
+
+
+# ---------------------------------------------------------------------------
+# issue #56：团队/企业订阅「自己工作用」的风险收敛
+#
+# 能避的风险（本模块负责）：
+#   1) 单席位**并发打爆** —— 团队套餐按席位限流，一个账号被多路并发很容易撞
+#      10605/RESOURCE_LIMIT；这里给每账号一个并发闸门（默认 1）。
+#   2) **机器枪式**请求节奏 —— 请求启动之间加最小间隔 + 抖动，避免固定频率特征。
+#   3) **误共享** —— 记录同一账号来自多少个不同客户端 IP；超过阈值打 WARN，
+#      提醒你可能有人共用这把 Key（组织审计最先看到的就是这个）。
+# 不能避的：额度归属、组织后台可见性、席位被回收、以及条款层面的问题。
+# ---------------------------------------------------------------------------
+_CLIENT_CTX = threading.local()
+_TEAM_GUARD_LOG = {"warned_wait": False, "ips": {}}
+
+
+def _team_guard_mode():
+    raw = str(os.environ.get("QD_TEAM_GUARD") or "auto").strip().lower()
+    if raw in ("1", "on", "true", "yes", "enable", "enabled"):
+        return "on"
+    if raw in ("0", "off", "false", "no", "disable", "disabled"):
+        return "off"
+    return "auto"
+
+
+def _team_max_concurrency():
+    try:
+        return max(1, int(os.environ.get("QD_TEAM_MAX_CONCURRENCY") or 1))
+    except Exception:
+        return 1
+
+
+def _team_min_gap():
+    try:
+        return max(0.0, float(os.environ.get("QD_TEAM_MIN_GAP_MS") or 400) / 1000.0)
+    except Exception:
+        return 0.4
+
+
+def _is_team_account(account):
+    """团队/企业账号判定：userType 或额度快照里有组织共享池（issue #56）。"""
+    if account is None:
+        return False
+    ut = str(getattr(account, "user_type", "") or "").lower()
+    if "team" in ut or "enterprise" in ut:
+        return True
+    cred = getattr(account, "credits", None)
+    if isinstance(cred, dict):
+        if isinstance(cred.get("shared"), dict) and cred["shared"].get("size"):
+            return True
+        for pkg in cred.get("packages") or []:
+            if isinstance(pkg, dict) and pkg.get("name") == "共享额度":
+                return True
+    return False
+
+
+def _traffic_guard_mode():
+    """issue #64：把「团队账号并发闸门」扩展成**对所有账号**生效的流量守卫。
+
+    出口/IP 我们控制不了，但「自己把某个号打到并发过高/节奏异常」是能控的：
+    - on   ：所有账号都走闸门（推荐给 intl / 数据中心出口场景）
+    - off  ：全部关闭
+    - 未设置：保持旧行为（只对团队账号生效）
+    """
+    raw = str(os.environ.get("QD_TRAFFIC_GUARD") or "").strip().lower()
+    if raw in ("1", "on", "true", "yes", "enable", "enabled"):
+        return "on"
+    if raw in ("0", "off", "false", "no", "disable", "disabled"):
+        return "off"
+    return ""
+
+
+def _team_guard_on(account):
+    forced = _traffic_guard_mode()
+    if forced == "on":
+        return True
+    if forced == "off":
+        return False
+    mode = _team_guard_mode()
+    if mode == "off":
+        return False
+    if mode == "on":
+        return True
+    return _is_team_account(account)
+
+
+def _team_acquire(account, model=""):
+    """拿一个团队账号租约（并发闸门 + 最小间隔）。拿不到返回 None（fail-open）。"""
+    if not _team_guard_on(account):
+        return None
+    try:
+        now = time.time()
+        gap = _team_min_gap()
+        with account._team_lock:
+            # 过期租约（>10min）视为泄漏，惰性清理，避免异常路径永久占坑
+            account.team_leases = {k: v for k, v in
+                                   (getattr(account, "team_leases", {}) or {}).items()
+                                   if now - v < 600}
+            last = float(getattr(account, "team_last_start", 0) or 0)
+        wait = max(0.0, last + gap - now)
+        if wait > 0:
+            time.sleep(min(wait, 5.0) + random.uniform(0, 0.12))
+        deadline = time.time() + float(os.environ.get("QD_TEAM_WAIT_SECS") or 30)
+        limit = _team_max_concurrency()
+        while True:
+            with account._team_lock:
+                if len(getattr(account, "team_leases", {})) < limit:
+                    lid = uuid.uuid4().hex
+                    account.team_leases[lid] = time.time()
+                    account.team_last_start = time.time()
+                    return lid
+            if time.time() >= deadline:
+                if not _TEAM_GUARD_LOG["warned_wait"]:
+                    _TEAM_GUARD_LOG["warned_wait"] = True
+                    log("team guard: concurrency limit %d reached for %s - "
+                        "proceeding without lease (issue #56)"
+                        % (limit, account.uid[:8]), level="WARN", tag="chat")
+                return None
+            time.sleep(0.05)
+    except Exception:
+        return None
+
+
+def _team_release(account, lease):
+    if not lease or account is None:
+        return
+    try:
+        with account._team_lock:
+            (getattr(account, "team_leases", {}) or {}).pop(lease, None)
+    except Exception:
+        pass
+
+
+def _team_note_client(account):
+    """记录本账号见过的客户端 IP；过多说明可能被共用（issue #56）。"""
+    if not _team_guard_on(account):
+        return
+    try:
+        ip = getattr(_CLIENT_CTX, "ip", None)
+        if not ip:
+            return
+        now = time.time()
+        with account._team_lock:
+            seen = {k: v for k, v in
+                    (getattr(account, "team_client_ips", {}) or {}).items()
+                    if now - v < 3600}
+            seen[ip] = now
+            account.team_client_ips = seen
+            n = len(seen)
+        limit = int(os.environ.get("QD_TEAM_MAX_CLIENTS") or 3)
+        if n > limit:
+            key = account.uid[:8]
+            last = _TEAM_GUARD_LOG["ips"].get(key, 0)
+            if now - last > 1800:
+                _TEAM_GUARD_LOG["ips"][key] = now
+                log("team guard: account %s used from %d distinct clients in "
+                    "the last hour - if this is a shared key, the org audit "
+                    "will see it (issue #56)" % (account.uid[:8], n),
+                    level="WARN", tag="chat")
+    except Exception:
+        pass
+
+
+class _TeamLeaseResp(object):
+    """把响应包一层：关闭/退出时释放团队租约（issue #56）。"""
+
+    def __init__(self, resp, account, lease):
+        self._resp = resp
+        self._account = account
+        self._lease = lease
+
+    def __getattr__(self, name):
+        return getattr(self._resp, name)
+
+    def __iter__(self):
+        return iter(self._resp)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def close(self):
+        try:
+            self._resp.close()
+        finally:
+            _team_release(self._account, self._lease)
+
+
 def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                   allow_queue_wait=True):
     """构造 COSY 签名请求并打开上游 SSE。返回 (resp, account, encoded)。
@@ -5619,7 +6322,12 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
       - 429    ：模型粒度频控 -> 解析 reset 时间做模型冷却换号
       - 418/5xx/provider_error（瞬时上游故障）-> 同账号快速重试 2 次
                 （1s/2s 退避），仍失败短冷却(15s/单账号3s)换号
-      - 其他 4xx（含客户端参数错）-> 快速失败，冷却换号，不重试
+      - 其他 4xx（客户端参数/请求形态问题）-> 快速失败，冷却换号，不重试；
+        其中请求自身的确定性错误（413 出站超限/参数非法/内容审核，见
+        _is_request_fault）换号结果不变：不冷却不换号，直接抛给客户端
+      - 熔断/降权三族记账（note_failure/note_unknown_failure）延迟到同一
+        请求换号成功后才落账：全池同样失败（断网/上游整体故障）不计入，
+        避免网络恢复后全池仍被熔断锁死
     全部账号失败后抛 RateLimited 或最后一个错误。
     """
     model = str(payload.get("model") or "")
@@ -5648,6 +6356,13 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
         # 在响应头/日志里对用户可见，也让 usage 行与真实出账区一致。
         usage_ctx["realm"] = realm
     encoded = qoder_encode(json.dumps(body_obj, ensure_ascii=False).encode("utf-8"))
+    # issue #59：超限就地报 413，不发网络请求、不轮询账号（Broken pipe 会打爆账号池）
+    _size = len(encoded.encode("utf-8")) if isinstance(encoded, str) else len(encoded)
+    if _size > MAX_UPSTREAM_BODY_BYTES:
+        log("outbound payload too large (%d bytes > %d) - refusing to send "
+            "(issue #59)" % (_size, MAX_UPSTREAM_BODY_BYTES),
+            level="WARN", tag="chat")
+        raise PayloadTooLarge(_size, MAX_UPSTREAM_BODY_BYTES)
 
     if not session_key:
         session_key = derive_affinity_key(body_obj.get("messages"))
@@ -5660,7 +6375,17 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
     last_error = None
     last_429 = None
     last_429_detail = ""
+    last_queue_wait = 0        # 队列 403（10605）解析出的 retryAfterSeconds
+    # 排队预算按**请求**计（不是按账号）：否则 N 个账号各等满 6 轮，
+    # 单请求会被拖到 3N 分钟（现场就出现过 197s）。
+    queue_tries = 0
+    queue_start = time.time()
     waited_cool = False
+    # 熔断/降权三族（note_failure/note_unknown_failure）先记进 blame，延迟到
+    # 「同一请求换号成功」才落账：全部账号同样失败时（本机断网、上游整体
+    # 故障、超大包被 RST），逐个记账会把全池误打进 30 分钟熔断，网络恢复也
+    # 解不开。换号后成功了，才说明先前失败的账号确实有问题。
+    blame = []                     # [(绑定方法, message)]
 
     # 额外 +2 次迭代预算：只供“短错误冷却等待续上”使用（正常轮换仍由
     # tried 集合自然终止）。
@@ -5695,13 +6420,15 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
         host_i = 0
         raw_url = hosts[host_i] + CHAT_PATH
 
+        # issue #56：团队账号的并发闸门 + 最小间隔（非团队账号直接返回 None）
+        _team_lease = _team_acquire(account, model)
+        _team_note_client(account)
+
         # ---- 发起请求（瞬时上游故障同账号快速重试） ----
         resp = None
         last_exc = None
         detail = ""
         tries = 0                 # 瞬时故障重试计数（1s/2s 退避）
-        queue_tries = 0           # 排队等待轮次（issue #38）
-        queue_start = time.time()
         while True:
             try:
                 sess = SESSIONS.get(account)
@@ -5741,7 +6468,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                         "(round %d/%d)"
                         % (account.uid[:8], model, qwait, queue_tries,
                            QUEUE_MAX_ROUNDS), level="WARN", tag="chat")
-                    time.sleep(qwait + 1)
+                    # 抖动 0~2s：多客户端同时被唤醒会一起打同一队列
+                    time.sleep(qwait + 1 + random.uniform(0, QUEUE_WAIT_JITTER_SECS))
                     continue
                 # 429/401/403 与客户端参数错：立即进入分类，不重试
                 if exc.code in (429, 401, 403):
@@ -5787,15 +6515,30 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                 break
 
         if resp is not None:
-            # task-74 三族：成功收尾 -> 统一复位（三族计数 + 软冷却 + 模型冷却）。
-            # note_success 是 clear_error(model) 的超集；刻意不动 balance_until。
+            # 同一请求换号后成功了：先前失败的账号确实有问题，此刻才落三族账
+            # （喂熔断/降权）。随后统一复位本账号；note_success 是
+            # clear_error(model) 的超集，刻意不动 balance_until。
+            for note, msg in blame:
+                note(msg)
             account.note_success(model=model)
+            if _team_lease:
+                # 关闭/退出时自动释放租约（handler 都走 with resp / resp.close）
+                return _TeamLeaseResp(resp, account, _team_lease), account, encoded
             return resp, account, encoded
 
+        # 本次尝试失败：先还租约，再做错误分类（分类里可能 continue/raise）
+        _team_release(account, _team_lease)
+        _team_lease = None
+
         exc = last_exc
+        # 重试多轮时同一个异常的 body 可能已被读空：detail 为空就走挂在异常上的
+        # qoder_detail，否则排队判定会失灵、退回「凭证被拒」（现场 197s 后 key 失效）。
+        if not detail:
+            detail = getattr(exc, "qoder_detail", "") or ""
         # ---- 错误分类（与原有轮换语义一致） ----
         if isinstance(exc, urllib.error.HTTPError):
             if exc.code == 429:
+                note_risk("rate", detail)
                 account.note_error("HTTP 429 (model throttled)", model=model,
                                    cooldown=60)
                 # task-74 三族之一：账号级软限流退避（连续才涨；单号池不接，
@@ -5811,6 +6554,23 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                 last_429_detail = detail
                 continue
             if exc.code in (401, 403):
+                _is_queue_http = bool(_queue_wait_seconds(detail))
+                note_risk("queue" if _is_queue_http else "rejected", detail)
+                if _is_queue_http:
+                    # issue #69 现场：上游排队超过预算后仍返回 **HTTP 403 + 10605**。
+                    # 这是模型级排队，**不是**账号问题——绝不能按「凭证被拒」处理：
+                    # 冷却 60s 会把唯一账号打成「no usable account」，面板看起来
+                    # 就像「Key 失效」。这里只记录、换号（如果有别的号），不惩罚。
+                    last_429 = exc
+                    last_429_detail = detail
+                    last_queue_wait = _queue_wait_seconds(detail)
+                    log("upstream still queued (HTTP %s / 10605) on '%s' model "
+                        "'%s' after %ds - not penalising the account"
+                        % (exc.code, account.uid[:8], model,
+                           int(time.time() - queue_start)),
+                        level="WARN", tag="chat")
+                    last_error = exc
+                    continue
                 dead = qoder_accounts.session_dead(detail)
                 disable, why = should_auto_disable_403(detail, model=model)
                 if exc.code == 403 and why == "paid_model":
@@ -5825,9 +6585,18 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                         level="WARN", tag="chat")
                     last_error = exc
                     continue
+                if exc.code == 403 and why == "probe_model_needs_payment":
+                    log("account %s hit a payment wall on probe model '%s' - "
+                        "not cooling (fix the probe model in settings)"
+                        % (account.uid[:8], model or "?"),
+                        level="WARN", tag="chat")
+                    last_error = exc
+                    continue
                 log("account %s rejected (HTTP %s), rotating"
                     % (account.uid[:8], exc.code))
-                if session_key and POOL:
+                # issue #64：排队(10605)不解绑会话亲和——排队是模型级的，换号
+                # 不会变快，反而造成「同会话在多账号间跳」的异常画像。
+                if session_key and POOL and not _is_queue_http:
                     POOL.affinity.unbind(session_key)
                 account.note_error("HTTP %s %s" % (exc.code, detail[:80]),
                                    cooldown=300 if dead else 60,
@@ -5855,10 +6624,11 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                 account.note_error(
                     "HTTP %s upstream transient: %s" % (exc.code, detail[:80]),
                     cooldown=15, single_account=(total <= 1))
-                # task-74 三族之二：连续硬失败喂熔断计数（3 次才起跳；单号池不接）
+                # task-74 三族之二：延迟记账——同一请求换号成功后才喂熔断
+                # 计数（3 次才起跳；单号池不接）
                 if total > 1:
-                    account.note_failure(
-                        "HTTP %s upstream transient" % exc.code)
+                    blame.append((account.note_failure,
+                                  "HTTP %s upstream transient" % exc.code))
                 log("upstream still transient (HTTP %d) after %d tries on "
                     "'%s' - short cooldown, rotating"
                     % (exc.code, TRANSIENT_MAX_RETRIES + 1, account.uid[:8]),
@@ -5867,6 +6637,15 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                 continue
             # 其他 4xx（客户端参数/请求形态问题）：快速失败，冷却换号
             if 400 <= exc.code < 500:
+                # issue #59 跟进：请求自身的确定性错误（413 出站超限/参数非法/
+                # 内容审核）换号结果不变——轮换只会把全池冷 60s，其他用户跟着
+                # 吃 503 "no usable account"。直接把原错误抛给客户端。
+                if _is_request_fault(exc.code, detail):
+                    log("request-fault HTTP %s on '%s' model '%s' - request "
+                        "itself is at fault: no rotation, no cooldown"
+                        % (exc.code, account.uid[:8], model),
+                        level="WARN", tag="chat")
+                    raise exc
                 if session_key and POOL:
                     POOL.affinity.unbind(session_key)
                 account.note_error("HTTP %s: %s" % (exc.code, detail[:80]),
@@ -5882,10 +6661,11 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                     # 传输抖动重试耗尽：短冷却换号（不重罚账号）
                     account.note_error("transport transient: %s" % str(exc)[:100],
                                        cooldown=15, single_account=(total <= 1))
-                    # task-74 三族之二（同族）：传输类连续硬失败喂熔断计数
+                    # task-74 三族之二（同族）：延迟记账——换号成功后才喂熔断计数
                     if total > 1:
-                        account.note_failure("transport transient: %s"
-                                             % type(exc).__name__)
+                        blame.append((account.note_failure,
+                                      "transport transient: %s"
+                                      % type(exc).__name__))
                     log("upstream transport still failing after %d tries on "
                         "'%s' - short cooldown"
                         % (TRANSIENT_MAX_RETRIES + 1, account.uid[:8]),
@@ -5893,16 +6673,25 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                 else:
                     account.note_error(str(exc)[:120], cooldown=60,
                                        single_account=(total <= 1))
-                    # task-74 三族之三：未知异常 -> 降权窗口（不是不可用）
+                    # task-74 三族之三：延迟记账——换号成功后才进降权窗口
                     if total > 1:
-                        account.note_unknown_failure(str(exc)[:120])
+                        blame.append((account.note_unknown_failure,
+                                      str(exc)[:120]))
                 last_error = exc
             continue
 
+    # 循环耗尽仍未成功：丢弃 blame，不落三族账——所有试过的账号都同样失败，
+    # 更像请求级或网络级故障，不是某个账号的问题。
+    if blame:
+        log("all tried accounts failed on '%s' - request/network level fault, "
+            "not counting toward breaker/downgrade" % model,
+            level="WARN", tag="chat")
     if last_error is not None:
         if last_429 is not None:
+            # 排队（10605/403）用上游给的 retryAfterSeconds，其余走模型冷却口径
             raise RateLimited(last_429, last_429_detail,
-                              wait=retry_after_seconds(model, realm))
+                              wait=last_queue_wait
+                              or retry_after_seconds(model, realm))
         raise last_error
     throttled, wait = realm_model_throttled(realm, model)
     if throttled:
@@ -6230,6 +7019,16 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
                     level="WARN", tag="chat")
                 raise InvalidToolArguments()
             elif _leaked_partial_droppable(_echo_src, allowed_names):
+                # issue #72：声明了 tools 却只拿到残缺回声 -> fail-closed（502），
+                # 不再把「空调用 + 正常内容」当成成功返回。
+                if allowed_names and _marker_only_echo(_echo_src):
+                    _kind72 = ("marker_only" if _marker_only_echo(_echo_src)
+                               else "partial_array")
+                    log("dropped truncated leaked tool-call echo (%d chars, %s, "
+                        "tools_declared=%d) — failing the turn closed (issue #72)"
+                        % (len(_echo_src), _kind72, len(allowed_names)),
+                        level="WARN", tag="chat")
+                    raise EmptyToolEcho(len(_echo_src), _kind72)
                 # issue #9：截断的 marker+JSON 回声不还原、也不透传。
                 log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
                     % len(_echo_src), level="WARN", tag="chat")
@@ -6599,6 +7398,20 @@ CUSTOM_TOOL_HINT = (
 )
 
 
+_UNSUPPORTED_TOOL_LOG = {}
+
+
+def _log_unsupported_tool(kind, where="tools"):
+    """未知工具类型被丢弃时记一次 WARN（同类每 10 分钟一条，issue #63）。"""
+    key = str(kind or "?")
+    now = time.time()
+    if now - _UNSUPPORTED_TOOL_LOG.get(key, 0) < 600:
+        return
+    _UNSUPPORTED_TOOL_LOG[key] = now
+    log("dropped unsupported tool type %r at %s - Qoder upstream only accepts "
+        '"function" (issue #63)' % (key, where), level="WARN", tag="chat")
+
+
 def _is_custom_tool(tool):
     return isinstance(tool, dict) and str(tool.get("type") or "").lower() == "custom"
 
@@ -6639,12 +7452,25 @@ def _downgrade_custom_tool(tool):
 
 
 def _tools_for_chat(tools):
-    """Downgrade custom tools; leave everything else untouched."""
+    """只保留 Qoder 上游能表达的工具（issue #63）。
+
+    Codex / MCP 会发 `type: "namespace"`、`web_search` 这类 Responses 专有工具；
+    原样透传会让上游在反序列化阶段 400（`unknown variant namespace, expected
+    function`），整个回合失败。这里把它们丢掉并记一次告警——function 工具不受
+    影响，custom 仍按原逻辑降级。
+    """
     out = []
     for t in tools or []:
         if not isinstance(t, dict):
             continue
-        out.append(_downgrade_custom_tool(t) if _is_custom_tool(t) else t)
+        if _is_custom_tool(t):
+            out.append(_downgrade_custom_tool(t))
+            continue
+        _kind = t.get("type")
+        if _kind in (None, "function"):
+            out.append(t)
+            continue
+        _log_unsupported_tool(_kind, "responses-tools")
     return out
 
 
@@ -7292,6 +8118,17 @@ def stream_responses_events(inner_lines, model, holder):
                 for c in leak_calls)
             calls_rem, clean_rem = None, leak_clean
         elif dropped_leak:
+            # issue #72：客户端声明了 tools、本轮又没恢复出任何调用时，
+            # **不能以 response.completed 收尾**（agent 会误判任务完成）。
+            _allowed72 = holder.get("allowed_names") or set()
+            if _allowed72 and _marker_only_echo(text_buffer):
+                _kind72 = ("marker_only" if _marker_only_echo(text_buffer)
+                           else "partial_array")
+                log("dropped truncated leaked tool-call echo (%d chars, %s, "
+                    "tools_declared=%d) — failing the turn closed (issue #72)"
+                    % (len(text_buffer), _kind72, len(_allowed72)),
+                    level="WARN", tag="chat")
+                raise EmptyToolEcho(len(text_buffer), _kind72)
             # issue #9：截断的 marker+JSON 回声 -> 不输出文本、不走 DSML 回退。
             log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
                 % len(text_buffer), level="WARN", tag="chat")
@@ -7753,6 +8590,11 @@ class Handler(BaseHTTPRequestHandler):
         self.realm_used = ""
         self.realm_reason = ""
         set_diag_request(False)      # keep-alive 复用：GET 一律清掉诊断标记
+        # issue #56：记录客户端 IP（团队账号的「是否被共用」统计用）
+        try:
+            _CLIENT_CTX.ip = self.client_address[0]
+        except Exception:
+            pass
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
@@ -7823,6 +8665,13 @@ class Handler(BaseHTTPRequestHandler):
                     force=bool(_u.get("force", [None])[0])))
             except Exception as exc:
                 return self._error(500, "update check failed: %s" % exc)
+        if path == "/update/plan":
+            # 一键更新前的预检（issue: 一键更新）：能不能更新、当前/目标版本、
+            # 是否容器、是否被禁用。不下载任何东西。
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            return self._json(200, update_plan_info())
         if path == "/diag/vm":
             # 本机虚拟化检测（看板「签到与福利中心」展示；中文输出）。
             # 以官方风控桥 runtime-info.exe 的 vmInfo 为准，桥不可用时本机交叉校验。
@@ -7843,6 +8692,8 @@ class Handler(BaseHTTPRequestHandler):
                 "accounts": len(POOL.accounts) if POOL else 0,
                 "accounts_ready": POOL.count_ready() if POOL else 0,
                 "api_key_required": bool(API_KEY),
+                "risk": risk_snapshot(),
+                "env": env_report(),
             }
             if self._key_ok():
                 info.update({
@@ -7861,6 +8712,29 @@ class Handler(BaseHTTPRequestHandler):
                                     "options": ["intl", "cn"],
                                     "auto_enabled": bool(AUTO_REALM_ENABLED),
                                     "auto_env": "QD_AUTO_REALM"})
+        if path in ("/models/refresh", "/v1/models/refresh"):
+            # issue #58：容器里模型清单陈旧时，不必重启即可重新向上游发现。
+            if not self._authorized():
+                return
+            req_realm = self._request_realm() or CURRENT_REALM
+            with _lock:
+                _models_cache.pop(req_realm, None)
+            try:
+                live = read_dynamic_models(realm=req_realm)
+            except Exception as exc:
+                return self._error(502, "model refresh failed: %s" % exc)
+            if not live:
+                return self._json(200, {"ok": False, "realm": req_realm,
+                                        "error": "upstream returned no models "
+                                                 "(check account/network)"})
+            _save_models_cache(req_realm, live)
+            entries = merge_catalog(live, realm=req_realm)
+            with _lock:
+                _models_cache[req_realm] = {"at": time.time(),
+                                            "data": entries}
+            return self._json(200, {"ok": True, "realm": req_realm,
+                                    "count": len(entries),
+                                    "ids": [mid for mid, _m in entries]})
         if path in ("/v1/models", "/models"):
             if not self._authorized():
                 return
@@ -8579,6 +9453,22 @@ class Handler(BaseHTTPRequestHandler):
                 "logs": res["logs"],
                 "accounts_count": res["accounts_count"],
             })
+        if path == "/scheduler/config":
+            # issue #70 后续：/scheduler/* 走的是账号路由前缀（is_account_route），
+            # 端点必须在这里，否则会被兜底成「unknown account endpoint」。
+            if not SCHEDULER:
+                return self._error(503, "scheduler not running",
+                                   "invalid_request_error")
+            try:
+                st = SCHEDULER.set_schedule(
+                    checkin_times=(payload or {}).get("checkin_times"),
+                    keepalive_times=(payload or {}).get("keepalive_times"),
+                    cron=(payload or {}).get("cron"),
+                    jitter_secs=(payload or {}).get("jitter_secs"))
+            except Exception as exc:
+                return self._error(400, "schedule update failed: %s" % exc,
+                                   "invalid_request_error")
+            return self._json(200, {"ok": True, "scheduler": st})
         if path == "/scheduler/trigger":
             if SCHEDULER:
                 return self._json(200, SCHEDULER.trigger_now())
@@ -8812,6 +9702,7 @@ class Handler(BaseHTTPRequestHandler):
                                    else "disabled"))
             return self._json(200, {"account": updated})
         if path == "/accounts/remark":
+            # 兼容别名（本 fork 早期面板用的路径）；行为与 /accounts/note 一致
             uid = str(payload.get("uid") or "").strip()
             if not uid:
                 return self._error(400, "uid required")
@@ -8937,6 +9828,14 @@ class Handler(BaseHTTPRequestHandler):
             record_error(model, 429, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000))
             return self._rate_limited(exc)
+        except UpstreamStatus as exc:
+            # issue #59：PayloadTooLarge(413) 等本地拦下的错误——明确状态码，
+            # 不进账号冷却/重试链路（上游根本没收到这个请求）。
+            _code = _to_int_status(exc.status)
+            record_error(model, _code, exc.detail,
+                         elapsed_ms=int((time.time() - t_start) * 1000))
+            _msg, _etype = friendly_upstream_error(_code, exc.detail)
+            return self._error(_code, _msg, _etype)
         except urllib.error.HTTPError as exc:
             detail = getattr(exc, "qoder_detail", "")
             if not detail:
@@ -9071,6 +9970,14 @@ class Handler(BaseHTTPRequestHandler):
             record_error(model, 429, exc.detail[:200],
                          elapsed_ms=int(t * 1000))
             return self._rate_limited(exc)
+        except UpstreamStatus as exc:
+            # issue #59：PayloadTooLarge(413) 等**上游未收到**的错误走这里——
+            # 明确状态码 + 可读文案，且不进入账号冷却/重试链路。
+            _code = _to_int_status(exc.status)
+            record_error(model, _code, exc.detail,
+                         elapsed_ms=int((time.time() - t_start) * 1000))
+            _msg, _etype = friendly_upstream_error(_code, exc.detail)
+            return self._error(_code, _msg, _etype)
         except urllib.error.HTTPError as exc:
             # 错误体在 open_upstream 中已读过（挂在 qoder_detail），二次 read
             # 会拿到残缺内容——优先取挂载值。
@@ -9145,8 +10052,9 @@ class Handler(BaseHTTPRequestHandler):
                                 attempts += 1
                                 log("responses in-stream envelope status %s "
                                     "(try %d/%d), reopening upstream"
-                                    % (exc.status, attempts + 1,
-                                       TRANSIENT_MAX_RETRIES + 1),
+                                    % (exc.status,
+                                       min(attempts + 1, _queue_budget()),
+                                       _queue_budget()),
                                     level="WARN", tag="chat")
                                 time.sleep(_envelope_retry_wait(exc, attempts))
                                 try:
@@ -9169,7 +10077,31 @@ class Handler(BaseHTTPRequestHandler):
                                         pass
                                 cur = cur2
                                 continue
-                            pump_exc = exc
+                            # issue #71：排队耗尽 -> 先试另一区（同一模型、区域级排队），
+                            # 仍不行再转成 429 + Retry-After，而不是把 403 丢给客户端。
+                            _alt71 = ("" if self.headers.get("X-Realm") else
+                                      _alt_realm_ready(req_realm, model))
+                            if _envelope_queue_wait(exc) > 0 and _alt71:
+                                log("queue exhausted -> failing over to %s (issue #71)"
+                                    % _alt71, level="WARN", tag="chat")
+                                try:
+                                    cur2, account, _ = open_upstream(
+                                        chat_req, session_key=session_key,
+                                        target_realm=_alt71,
+                                        usage_ctx=usage_ctx)
+                                except Exception as rex:
+                                    log("cross-realm reopen failed: %s"
+                                        % str(rex)[:120], level="WARN")
+                                    pump_exc = _as_rate_limited_for_queue(exc, model)
+                                    break
+                                if cur is not upstream:
+                                    try:
+                                        cur.close()
+                                    except Exception:
+                                        pass
+                                cur = cur2
+                                continue
+                            pump_exc = _as_rate_limited_for_queue(exc, model)
                             break
                 finally:
                     if cur is not upstream:
@@ -9235,7 +10167,74 @@ class Handler(BaseHTTPRequestHandler):
         # chat 的出口/原因带到别的响应上。
         self.realm_used = ""
         self.realm_reason = ""
+        # issue #56：记录客户端 IP（团队账号「是否被共用」统计用）
+        try:
+            _CLIENT_CTX.ip = self.client_address[0]
+        except Exception:
+            pass
         path = self.path.split("?")[0]
+        if path == "/accounts/note":
+            # issue #69：账号备注（面板内直接编辑；纯展示字段，不参与路由判定）
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            try:
+                body = self._read_payload()
+            except Exception as exc:
+                return self._error(400, "invalid json: %s" % exc,
+                                   "invalid_request_error")
+            uid = str((body or {}).get("uid") or "").strip()
+            note = str((body or {}).get("note") or "").strip()[:120]
+            if not uid:
+                return self._error(400, "uid is required",
+                                   "invalid_request_error")
+            if not POOL:
+                return self._error(503, "account pool not ready",
+                                   "invalid_request_error")
+            hit = None
+            for acc in POOL.accounts:
+                if acc.uid == uid:
+                    hit = acc
+                    break
+            if hit is None:
+                return self._error(404, "account not found: %s" % uid,
+                                   "invalid_request_error")
+            hit.note = note
+            try:
+                hit.save(ACCOUNTS_DIR)
+            except Exception as exc:
+                return self._error(500, "save failed: %s" % exc)
+            return self._json(200, {"ok": True, "uid": uid, "note": note})
+        if path == "/update/apply":
+            # 一键更新：下载官方 release -> 校验 -> 备份 -> 替换 -> 自动重启。
+            # 只允许面板会话 + 本机（可用 QD_UPDATE_ALLOW_REMOTE=1 放开）。
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            if UPDATE_DISABLED:
+                return self._error(403, "update is disabled (QD_UPDATE_DISABLE=1)",
+                                   "invalid_request_error")
+            if qoder_updater._in_container():
+                return self._error(409,
+                                   "运行在容器里：镜像重建会覆盖本地改动，请在宿主机"
+                                   "执行 docker compose pull && docker compose up -d",
+                                   "invalid_request_error")
+            if not _update_allow_remote() and not _is_loopback(
+                    (self.client_address or ["?"])[0]):
+                return self._error(403, "update is loopback-only "
+                                        "(set QD_UPDATE_ALLOW_REMOTE=1 to allow)",
+                                   "invalid_request_error")
+            try:
+                res = apply_update_now()
+            except Exception as exc:
+                return self._error(500, "update failed: %s" % exc)
+            if not res.get("ok"):
+                return self._json(200, res)
+            restarted = qoder_updater.schedule_restart(_LAUNCH_ARGV, delay=1.5)
+            log("update: %s -> %s (%d files, backup=%s), restarting=%s"
+                % (res.get("from"), res.get("to"), len(res.get("files") or []),
+                   res.get("backup") or "-", restarted), tag="update")
+            return self._json(200, dict(res, restarting=restarted))
         if path == "/settings/save":
             if not self._panel_ok():
                 return self._error(401, "panel password required",
@@ -9358,6 +10357,14 @@ class Handler(BaseHTTPRequestHandler):
             record_error(model, 429, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000))
             return self._rate_limited(exc)
+        except UpstreamStatus as exc:
+            # issue #59：PayloadTooLarge(413) 等**上游未收到**的错误走这里——
+            # 明确状态码 + 可读文案，且不进入账号冷却/重试链路。
+            _code = _to_int_status(exc.status)
+            record_error(model, _code, exc.detail,
+                         elapsed_ms=int((time.time() - t_start) * 1000))
+            _msg, _etype = friendly_upstream_error(_code, exc.detail)
+            return self._error(_code, _msg, _etype)
         except urllib.error.HTTPError as exc:
             # 错误体在 open_upstream 中已读过（挂在 qoder_detail），二次 read
             # 会拿到残缺内容——优先取挂载值。
@@ -9424,8 +10431,9 @@ class Handler(BaseHTTPRequestHandler):
                                 attempts += 1
                                 log("chat in-stream envelope status %s on "
                                     "model '%s' (try %d/%d), reopening upstream"
-                                    % (exc.status, model, attempts + 1,
-                                       TRANSIENT_MAX_RETRIES + 1),
+                                    % (exc.status, model,
+                                       min(attempts + 1, _queue_budget()),
+                                       _queue_budget()),
                                     level="WARN", tag="chat")
                                 time.sleep(_envelope_retry_wait(exc, attempts))
                                 try:
@@ -9445,7 +10453,31 @@ class Handler(BaseHTTPRequestHandler):
                                         pass
                                 cur = cur2
                                 continue
-                            pump_exc = exc
+                            # issue #71：排队耗尽 -> 先试另一区（同一模型、区域级排队），
+                            # 仍不行再转成 429 + Retry-After，而不是把 403 丢给客户端。
+                            _alt71 = ("" if self.headers.get("X-Realm") else
+                                      _alt_realm_ready(req_realm, model))
+                            if _envelope_queue_wait(exc) > 0 and _alt71:
+                                log("queue exhausted -> failing over to %s (issue #71)"
+                                    % _alt71, level="WARN", tag="chat")
+                                try:
+                                    cur2, account, _ = open_upstream(
+                                        payload, session_key=session_key,
+                                        target_realm=_alt71,
+                                        usage_ctx=usage_ctx)
+                                except Exception as rex:
+                                    log("cross-realm reopen failed: %s"
+                                        % str(rex)[:120], level="WARN")
+                                    pump_exc = _as_rate_limited_for_queue(exc, model)
+                                    break
+                                if cur is not upstream:
+                                    try:
+                                        cur.close()
+                                    except Exception:
+                                        pass
+                                cur = cur2
+                                continue
+                            pump_exc = _as_rate_limited_for_queue(exc, model)
                             break
                 finally:
                     if cur is not upstream:
@@ -9690,6 +10722,39 @@ def main():
     except Exception as exc:
         CREDITS_USAGE_REFRESHER = None
         log("credits usage refresher failed to start: %s" % exc, level="WARN")
+    # issue #57：容器出口反代**国际版**容易被上游风控（聊天变排队）。检测到
+    # 容器 + intl 账号时给出明确告警——不阻断，只提示换自建出口或改用国内版。
+    try:
+        _intl = [a for a in (POOL.accounts if POOL else [])
+                 if getattr(a, "realm", "") == "intl" and a.enabled]
+        if _intl and _in_container():
+            log("container egress + intl accounts detected (%d): upstream may "
+                "rate-limit or queue the intl gateway from datacenter IPs. "
+                "Prefer a residential egress or the CN realm (issue #57)."
+                % len(_intl), level="WARN", tag="realm")
+    except Exception:
+        pass
+    # issue #64：容器/部署自检——时钟漂移会让 COSY 签名直接 401，
+    # 账户目录不可写会让设备身份无法持久（重建即换设备）。
+    try:
+        _skew = _measure_clock_skew()
+        _env = env_report()
+        log("env: container=%s proxy=%s accounts_writable=%s identity_cached=%s "
+            "clock_skew=%ss traffic_guard=%s"
+            % (_env["container"], _env["proxy"], _env["accounts_writable"],
+               _env["identity_cached"],
+               "?" if _skew is None else _skew, _env["traffic_guard"]),
+            tag="realm")
+        if _skew is not None and abs(_skew) > 120:
+            log("clock skew %ss detected: COSY signatures are time-based and will "
+                "fail with 401 - fix container time sync (issue #64)" % _skew,
+                level="WARN", tag="realm")
+        if not _env["accounts_writable"]:
+            log("accounts dir is not writable: device identity cannot persist, "
+                "container rebuild will look like a new device (issue #18)",
+                level="WARN", tag="realm")
+    except Exception:
+        pass
     from qoder_scheduler import Scheduler
     SCHEDULER = Scheduler(POOL)
     SCHEDULER.start()

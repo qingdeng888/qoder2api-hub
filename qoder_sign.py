@@ -47,6 +47,7 @@ x-model-key 决定上游模型路由。会话按账号缓存，access token 轮�
 """
 import base64
 import hashlib
+import sys
 import hmac
 import json
 import os
@@ -523,6 +524,25 @@ def rsa_pkcs1v15_encrypt(plain: bytes, n: int = None, e: int = None) -> bytes:
 # 内置常量为 "1.1.64"（SDK 里 `s5="1.1.64"`，cosy-version 头与 payload 共用），
 # 旧值 "0.1.43" 来自更早的 CLI 版本。实测 1.1.64 可用于模型列表与推理。
 COSY_VERSION = "1.1.64"
+# issue #64（逆向官方 intl 客户端）：推理 SSE 还会带 Cosy-MachineOS 与
+# Cosy-MachineHostname（仅 infer-sse 场景）。我们此前只在 openapi/活动头里带
+# machineos，推理链路缺这两个 —— 补上以对齐官方形态；QD_COSY_OS_HEADERS=0 可关。
+def _cosy_os_headers():
+    """是否在推理头里带 machineos/hostname（issue #64，默认开）。"""
+    return str(os.environ.get("QD_COSY_OS_HEADERS") or "1").strip().lower() \
+        not in ("0", "off", "false", "no", "disable", "disabled")
+
+
+def _machine_hostname(uid):
+    """按账号稳定派生主机名（形如 DESKTOP-1A2B3C4）。"""
+    h = hashlib.md5(("hostname:" + (uid or "anonymous")).encode("utf-8")) \
+        .hexdigest()
+    return "DESKTOP-" + h[:7].upper()
+
+
+COSY_MACHINE_OS = (os.environ.get("QD_COSY_MACHINE_OS") or
+                   ("x86_64_win32" if sys.platform.startswith("win")
+                    else "x86_64_linux"))
 DEFAULT_USER_TYPE = "personal_professional_trial"
 
 
@@ -550,6 +570,8 @@ class CosySession(object):
         self.machine_id = derive_id(self.uid, "machine")
         self.machine_token = derive_machine_token(self.uid)
         self.machine_type = derive_machine_type(self.uid)
+        # 稳定主机名（官方 infer-sse 会带；同账号永远同一个，跨账号不同）
+        self.machine_hostname = _machine_hostname(self.uid)
         self.access_token = access_token or ""
 
         self.temp_key = uuid.uuid4().hex[:16]                 # 16 ASCII -> AES-128
@@ -617,6 +639,9 @@ class CosySession(object):
         }
         if sse:
             h["cache-control"] = "no-cache"
+            if _cosy_os_headers():
+                h["cosy-machineos"] = COSY_MACHINE_OS
+                h["cosy-machinehostname"] = self.machine_hostname
         if model_key:
             h["x-model-key"] = model_key
             h["x-model-source"] = "system"

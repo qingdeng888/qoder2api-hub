@@ -31,3 +31,7 @@ _acc/
 # ---- 本地部署私密配置（API Key / 面板密码）----
 .env
 .env.local
+
+# 运行时 PID 文件（上游误提交过，这里不再跟踪）
+qoder-proxy.pid
+*.pid

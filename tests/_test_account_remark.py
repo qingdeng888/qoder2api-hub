@@ -104,16 +104,21 @@ def main():
         check("导出文档可再次解析", not problem and len(rows) == 2,
               (problem, len(rows)))
         kwargs = A.normalise_import_row(rows[1])
-        check("导入保留备注", kwargs.get("remark") == "导出测试",
-              kwargs.get("remark"))
+        # 上游 #69 把备注统一叫 note；本 fork 的 remark 是它的别名
+        check("导入保留备注（note）", kwargs.get("note") == "导出测试",
+              kwargs.get("note"))
         check("导入保留出口绑定字段",
               "proxyMode" in kwargs and "proxyId" in kwargs, sorted(kwargs))
     finally:
         shutil.rmtree(temp, ignore_errors=True)
 
     html = open(os.path.join(ROOT, "dashboard.html"), encoding="utf-8").read()
-    for token in ("editAccountRemark", "/accounts/remark", "添加备注", "📝"):
+    # 面板备注 UI 统一走上游 #69 的实现（/accounts/note + editAccountNote）
+    for token in ("editAccountNote", "/accounts/note", "备注"):
         check("面板接线: %s" % token, token in html)
+    src = open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read()
+    check("备注接口同时保留 fork 的 /accounts/remark 别名",
+          '"/accounts/note"' in src and '"/accounts/remark"' in src)
 
     print("")
     print("SUMMARY: TOTAL %d checks, %d passed, %d failed"

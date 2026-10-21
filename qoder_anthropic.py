@@ -31,8 +31,10 @@ EFFORT_RANK = {"none": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4,
                "xhigh": 5, "max": 6}
 _EFFORT_ORDER = tuple(sorted(EFFORT_RANK, key=lambda k: EFFORT_RANK[k]))
 # budget_tokens 断点 -> 档位（设计文档 §4.2）
+# issue #62：原来最高只到 high，budget 传多大都够不到 max。补一档：
+# <=1024 minimal / <=4096 low / <=16384 medium / <=32768 high / 更大 max。
 BUDGET_STEPS = ((1024, "minimal"), (4096, "low"), (16384, "medium"),
-                (None, "high"))
+                (32768, "high"), (None, "max"))
 _STOP_REASON = {"stop": "end_turn", "length": "max_tokens",
                 "tool_calls": "tool_use", "function_call": "tool_use"}
 
@@ -211,19 +213,29 @@ def effort_from_anthropic(payload, catalog_meta=None, supported=None):
       · 档位表为空 -> None（保持「不猜测」语义）
     """
     th = payload.get("thinking")
+    oc = payload.get("output_config")
+    _oc_effort = None
+    if isinstance(oc, dict) and oc.get("effort"):
+        _cand = str(oc["effort"]).strip().lower()
+        _oc_effort = _cand if _cand in EFFORT_RANK else None
     if not isinstance(th, dict):
-        oc = payload.get("output_config")
-        if isinstance(oc, dict) and oc.get("effort"):
-            th = {"type": "enabled", "budget_tokens": None,
-                  "effort": oc.get("effort")}
-        else:
+        # 完全没有 thinking：只有 output_config.effort 也能决定档位
+        if not _oc_effort:
             return None
+        th = {"type": "enabled", "budget_tokens": None,
+              "effort": _oc_effort}
     if str(th.get("type") or "").lower() == "disabled":
         return None
     target = None
     if th.get("effort"):
         cand = str(th["effort"]).strip().lower()
         target = cand if cand in EFFORT_RANK else None
+    if target is None:
+        # issue #62：Claude Code 对**第三方模型名**发的是
+        #   thinking={"type":"adaptive"} + output_config={"effort":"low|medium|high|max"}
+        # adaptive 是合法 dict 但没有 effort/budget_tokens，旧实现因此跳过
+        # output_config 分支 -> 四档全部映射成 None（静默固定跑默认档=max）。
+        target = _oc_effort
     if target is None:
         budget = th.get("budget_tokens")
         if budget is None:

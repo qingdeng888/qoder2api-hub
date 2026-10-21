@@ -218,10 +218,13 @@ def main():
                                             model="Qwen3.8-Flash",
                                             session_key=None)
         # 排队仍然只做模型级冷却（免费模型也一样）
-        check("信封 403（10605 排队）-> **不**禁用，只冷却",
+        # 上游 #71 起：排队在解绑会话/冷却之前就短路（连冷却都不做），
+        # 这里对齐上游语义——排队既不冷却也不禁用。
+        check("信封 403（10605 排队）-> 既不冷却也不禁用（#71）",
               queue_acc.enabled is True and queue_acc.disabled_until == 0
-              and queue_acc.model_cooldowns.get("Qwen3.8-Flash", 0) > time.time(),
-              (queue_acc.enabled, queue_acc.disabled_until))
+              and not queue_acc.model_cooldowns,
+              (queue_acc.enabled, queue_acc.disabled_until,
+               dict(queue_acc.model_cooldowns)))
 
         policy_acc = A.Account({"uid": "env403-3", "realm": "intl",
                                 "accessToken": "dt-z"})

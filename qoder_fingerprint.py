@@ -10,34 +10,66 @@ COSY 推理签名会携带 cosy-machineid / cosy-machinetoken / cosy-machinetoke
 这里提供与 WorkBuddy 网关同构的稳定派生逻辑：
   - machineId  : 由 uid 稳定派生（同一账号永远相同）
   - sessionId  : 由 uid 稳定派生（会话隔离）
-  - request id : 稳定前缀 + 微秒时间戳（防重放且可溯源）
+  - request id : 每请求纯随机（与账号无关，见 generate_request_id）
+
+形态口径（2026-10-20 修订）：官方客户端的 machineId 取自 OS 硬件 UUID，是
+**带连字符的 UUIDv4 形状**；请求 id 则是**每请求独立的随机 32 位 hex**。本模块
+此前输出 32 位无连字符 hex，请求 id 还带 uid 派生的固定前缀——两者都对不上官方
+形态，本身就是可被聚类的「网关特征」。现按官方形态对齐（与 WorkBuddy 网关
+v5.8.4 抓包后的修正同口径）。
+
+取值范围仍必须按账号派生：官方客户端「一个进程 = 一台设备」，而网关是一个长驻
+进程同时冒充几十台设备。照官方那样在进程维度取一次，等于让所有账号共用同一个
+值，反而把它们关联到同一台机器上，与「每账号一台设备」的隔离口径自相矛盾。
 """
 import hashlib
 import os
 import time
+import uuid
+
+
+def _device_id_legacy() -> bool:
+    """QD_DEVICE_ID_LEGACY=1 时保留旧的「32 位无连字符 hex」形态。
+
+    issue #61 把设备码改成 UUID 形状对齐官方客户端，代价是**存量账号的
+    machineId/sessionId 会变**（对上游等于换了一台设备）。已经稳定跑着的号池
+    如果想避免这次「换设备」，升级前设这个开关即可保持旧值不变。
+    新号池不需要它（默认 UUID 形状更接近官方）。
+    """
+    raw = str(os.environ.get("QD_DEVICE_ID_LEGACY") or "").strip().lower()
+    return raw in ("1", "on", "true", "yes", "enable", "enabled")
 
 
 def derive_id(uid: str, salt: str) -> str:
-    """由 uid + salt 稳定派生一个 32 位十六进制设备/会话标识。
+    """由 uid + salt 稳定派生一个**带连字符的 UUID 形状**设备/会话标识。
 
     幂等：同一账号每次调用产生相同值，彻底避免随机机器码导致的上游风控。
+    输出形如 `a1b2c3d4-e5f6-4a78-a9b0-c1d2e3f4a5b6`——版本位固定为 `4`、
+    变体位固定为 `a`，与真实客户端的 machineId 逐字符同形。
 
-    长度事实（勿"顺手修正"）：md5().hexdigest() 恒为 32 个十六进制字符，
-    因此 [:36] 是防御性切片（对 32 长串为恒等），实际输出恒为 32 位；
-    旧注释写作"36 位"属文档漂移，已在本轮与实现对齐。
-    若要补齐到 36 位（UUID 形态），会改变所有已入池账号的 machineId /
-    sessionId，属破坏性变更：必须 Lead 批准 + 全量账号回归，禁止单方面修改。
+    ⚠️ 破坏性变更提示：本函数输出形态在 2026-10-20 由「32 位无连字符 hex」
+    改为「UUID 带连字符」，因此**已入池账号的 machineId / sessionId 会变**。
+    对上游而言等于这些账号换了一台设备。新号池无影响；存量号池升级前请评估
+    （官方对「换设备」本身不敏感，真正敏感的是同设备关联多号）。
     """
     seed = f"{salt}:{uid or 'anonymous'}"
-    # md5 hexdigest 恒为 32 字符；[:36] 是恒等切片（防御性保留，结果不变）
-    return hashlib.md5(seed.encode("utf-8")).hexdigest()[:36]
+    h = hashlib.md5(seed.encode("utf-8")).hexdigest()
+    if _device_id_legacy():
+        return h            # 旧形态：32 位无连字符 hex（存量号池平滑用）
+    # 伪造 UUIDv4 的版本位（第 13 位）与变体位（第 17 位），与官方同形。
+    h = h[:12] + "4" + h[13:16] + "a" + h[17:]
+    return "%s-%s-%s-%s-%s" % (h[0:8], h[8:12], h[12:16], h[16:20], h[20:32])
 
 
 def generate_request_id(uid: str) -> str:
-    """生成带稳定前缀与微秒时间戳的防风控请求 ID。"""
-    prefix = derive_id(uid, "req")
-    suffix = str(time.time_ns() % 1000000).zfill(6)
-    return f"{prefix}-{suffix}"
+    """生成 X-Request-ID：32 位无连字符 hex，**每请求纯随机**。
+
+    真实客户端的请求 id 与账号无关（每条随机），所以这里**不再掺 uid 派生的
+    前缀**——那是一条会出现在每个请求里的稳定「网关特征」，最容易被动聚类。
+
+    uid 参数保留只为兼容既有调用点（签名不破坏）。
+    """
+    return uuid.uuid4().hex
 
 
 def derive_machine_type(uid: str) -> str:

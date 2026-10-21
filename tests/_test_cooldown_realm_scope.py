@@ -4,7 +4,7 @@
     python tests/_test_cooldown_realm_scope.py
 
 钉住四组数字 + 一口径：
-  1) 双区池 10605 排队 -> 冷却 30->3；
+  1) 双区池 10605 排队 -> 不冷却（#71 起排队不算账号问题）；
   2) 同场景 wait 0->3（补丁 1 单独不够的证据）；
   3) 真 429 长窗 -> 仍不等（交回 429 路径）；
   4) 号 A 长频控 + 号 B 短冷却 -> 不因 A 放弃 B；
@@ -65,10 +65,11 @@ P.POOL = _pool
 P._handle_envelope_account_cooldown(_accs[0], P.UpstreamStatus(403, DETAIL),
                                     model=MODEL, session_key=None)
 _cd = _accs[0].model_cooldowns.get(MODEL, 0.0) - time.time()
-check("双区池：10605 排队冷却 30 -> 3（本区域唯一号 = 单号池）",
-      0 < _cd <= 4.0, _cd)
-check("双区池：_short_error_cooldown_wait 0 -> 3（补丁 1 单独不够的证据）",
-      0 < P._short_error_cooldown_wait("cn", MODEL, exclude=set()) <= 4.0,
+# issue #71：信封层排队不再惩罚账号（冷却会让单号池直接「无号可用」）
+check("双区池：10605 排队不再冷却账号", _cd <= 0.001, _cd)
+# issue #71：排队不再给账号写冷却，因此也没有「等短冷却」可等
+check("双区池：_short_error_cooldown_wait 为 0（排队不产生账号冷却）",
+      P._short_error_cooldown_wait("cn", MODEL, exclude=set()) == 0.0,
       P._short_error_cooldown_wait("cn", MODEL, exclude=set()))
 
 # ---- 2) 单区池回归保护 ----
@@ -77,7 +78,7 @@ P.POOL = _pool2
 P._handle_envelope_account_cooldown(_accs2[0], P.UpstreamStatus(403, DETAIL),
                                     model=MODEL, session_key=None)
 _cd2 = _accs2[0].model_cooldowns.get(MODEL, 0.0) - time.time()
-check("单区池：10605 冷却仍是 3（回归保护）", 0 < _cd2 <= 4.0, _cd2)
+check("单区池：10605 排队同样不冷却（#71）", _cd2 <= 0.001, _cd2)
 
 # ---- 3) 真 429 长窗：必须保持「不等 + 交回 429」 ----
 _pool3, _accs3 = build(["cn"])

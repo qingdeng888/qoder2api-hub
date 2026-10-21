@@ -172,6 +172,8 @@ def _clean_key_entry(entry):
         # P1-4：每 Key 模型白名单（空列表 = 不限制）。**必须显式保留**——
         # 本函数是白名单式重建，漏掉即「保存时被静默丢弃」（limits 同型坑）。
         "models": _clean_model_patterns(entry.get("models")),
+        # issue #69：Key 备注（纯展示，不参与鉴权；同样必须显式保留）。
+        "note": str(entry.get("note") or "").strip()[:120],
     }
 
 

@@ -265,8 +265,12 @@ check("model_entry upstream_key kept", me["upstream_key"] == "qmodel_38max")
 check("model_entry aliases cover key + bracket form + friendly alias",
       "qmodel_38max" in me["aliases"] and "qmodel_38max (Qwen3.8-Max)" in me["aliases"]
       and "qwen3.8-max" in me["aliases"], me.get("aliases"))
+# issue #68：文案会随官方文档更新（当前 qmodel_38max 是「Qwen 最新基座模型…」）。
+# 断言不再硬编码某个词，而是比对**文案源**本身，避免每次改文案都要动测试。
 check("model_entry description = official desktop copy",
-      "千问" in (me.get("description") or ""), (me.get("description") or "")[:60])
+      bool(me.get("description"))
+      and me.get("description") == C.official_description("qmodel_38max"),
+      (me.get("description") or "")[:60])
 check("model_entry enabled flag", me["enabled"] is True)
 check("model_entry peak/valley factors",
       me["price_factor_peak"] == 0.5 and me["price_factor_valley"] == 0.2)
@@ -1642,11 +1646,13 @@ check("daily row carries a jump url (campaignUrl or activities page)",
       _intl_row.get("jump_url"))
 
 print()
-print("[19] gateway host failover (official intl api1 -> api2; CN single host)")
-check("gateway_candidates: intl primary is api1 with api2/api3 fallbacks",
-      A.gateway_candidates("intl") == ["https://api1.qoder.sh",
+print("[19] gateway host failover (official intl api3 -> api2/api1; CN single host)")
+# issue #64：官方 0.4.8 的 endpoint 缓存里 inference=api3、securityInference=api2，
+# api1 已不是候选首位（本机实测也常年超时）。断言随官方顺序更新。
+check("gateway_candidates: intl primary is api3 with api2/api1 fallbacks",
+      A.gateway_candidates("intl") == ["https://api3.qoder.sh",
                                        "https://api2.qoder.sh",
-                                       "https://api3.qoder.sh"],
+                                       "https://api1.qoder.sh"],
       A.gateway_candidates("intl"))
 check("gateway_candidates: cn has a single official host",
       A.gateway_candidates("cn") == ["https://gateway.qoder.com.cn"],
@@ -1670,7 +1676,8 @@ class _Resp19(object):
 
 def _fake_urlopen19(req, timeout=None):
     _hits19.append(req.full_url)
-    if "api1.qoder.sh" in req.full_url:
+    # issue #64：官方顺序已改为 api3 主、api2 备 → 让主 host 失败，验证切到 api2。
+    if "api3.qoder.sh" in req.full_url:
         raise _ssl19.SSLError("simulated TLS EOF on primary host")
     return _Resp19()
 
@@ -1696,8 +1703,8 @@ finally:
 
 check("failover: request succeeded after primary host transport error",
       _err19 is None and _acc19.uid == "h19", _err19)
-check("failover: both hosts were tried in order (api1 then api2)",
-      len(_hits19) == 2 and "api1.qoder.sh" in _hits19[0]
+check("failover: both hosts were tried in order (api3 then api2)",
+      len(_hits19) == 2 and "api3.qoder.sh" in _hits19[0]
       and "api2.qoder.sh" in _hits19[1], _hits19)
 check("failover: signature path unchanged across hosts",
       _hits19[0].split("?")[0].endswith(P.CHAT_PATH.split("?")[0]),
@@ -2555,7 +2562,8 @@ try:
     P._handle_envelope_account_cooldown(_acc26, _UpErr26(
         403, '{"code":"10605","message":"{\"isQueued\":true,\"retryAfterSeconds\": 30}"}'),
         model="qfmodel", session_key="sk-pr7")
-    _n1 = _acc26.notes[-1]
+    _n1 = _acc26.notes[-1] if _acc26.notes else None
+    _aff_after_queue = list(P.POOL.affinity.calls)
     P._handle_envelope_account_cooldown(_acc26, _UpErr26(403, "permission denied"),
                                         model="qfmodel", session_key="sk-pr7")
     _n2 = _acc26.notes[-1]
@@ -2569,10 +2577,10 @@ try:
     _aff26_calls = list(P.POOL.affinity.calls)
 finally:
     P.POOL = _orig_pool26
-check("10605 排队 -> 模型级冷却 30s（按上游 retryAfterSeconds）+ 解绑会话",
-      _n1["cooldown"] == 30 and _n1["model"] == "qfmodel"
-      and set(_aff26_calls) == {"sk-pr7"} and len(_aff26_calls) >= 1,
-      (_n1, _aff26_calls))
+# issue #71：排队不再惩罚账号（不冷却、不解绑）——冷却会把单号池打成
+# 「no usable account」，面板看起来就是凭证失效。
+check("10605 排队 -> 不再冷却账号 / 不解绑会话（issue #71）",
+      _n1 is None and not _aff_after_queue, (_n1, _aff_after_queue))
 check("403 非排队 -> 账号级冷却 60s", _n2["cooldown"] == 60 and _n2["model"] is None, _n2)
 check("429 -> 模型级冷却 30s", _n3["cooldown"] == 30 and _n3["model"] == "qfmodel", _n3)
 check("死会话 -> 300s + 停用账号（与 open_upstream 同语义）",
@@ -4989,6 +4997,72 @@ except Exception:
 check("#63-C3e 设置保存路径会打一次 quota guard flip (settings) 日志（接线存在性检查）",
       "quota guard flip (settings)" in _src45,
       _src45.count("quota guard flip"))
+
+print()
+print("[45] 出站身份形态：UUID 设备码 / 随机请求 id / 官方 UA（防风控聚类）")
+import re as _re45
+import uuid as _uuid45
+
+# --- 45.1 derive_id 必须是带连字符的 UUIDv4 形状 ---
+_UUID4_45 = _re45.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-a[0-9a-f]{3}-[0-9a-f]{12}$")
+_d45 = A.derive_id("test-uid-001", "machine")
+check("#45-1 derive_id 输出 UUIDv4 形状（8-4-4-4-12 且版本位=4、变体位=a）",
+      bool(_UUID4_45.match(_d45)), _d45)
+check("#45-2 derive_id 长度 = 36（含 4 个连字符，与官方 machineId 同形）",
+      len(_d45) == 36 and _d45.count("-") == 4, (len(_d45), _d45.count("-")))
+check("#45-3 derive_id 幂等（同 uid+salt 两次调用逐字节相同）",
+      A.derive_id("test-uid-001", "machine") == _d45)
+check("#45-4 derive_id 不同 salt 产出不同值（machine / session 不撞）",
+      A.derive_id("test-uid-001", "machine") != A.derive_id("test-uid-001", "session"))
+check("#45-5 derive_id 不同 uid 产出不同值（多号天然隔离）",
+      A.derive_id("uid-a", "machine") != A.derive_id("uid-b", "machine"))
+check("#45-6 derive_id 空 uid 走 anonymous 兜底且仍为合法 UUID 形状",
+      bool(_UUID4_45.match(A.derive_id("", "machine"))), A.derive_id("", "machine"))
+
+# --- 45.2 generate_request_id 必须每请求随机、且不掺 uid 派生前缀 ---
+_r45 = [A.generate_request_id("test-uid-001") for _ in range(50)]
+check("#45-7 request id 为 32 位无连字符 hex（官方实测形态）",
+      all(_re45.match(r"^[0-9a-f]{32}$", x) for x in _r45), _r45[0])
+check("#45-8 request id 每请求随机（50 次全不相同）",
+      len(set(_r45)) == 50, len(set(_r45)))
+check("#45-9 request id 不掺 uid 派生前缀（50 个值里不含 derive_id(uid,'req') 的任何前缀）",
+      not any(x.startswith(A.derive_id("test-uid-001", "req")[:8]) for x in _r45),
+      A.derive_id("test-uid-001", "req")[:8])
+check("#45-10 request id 与账号无关（不同 uid 产出同分布、互不影响）",
+      len({A.generate_request_id("uid-a") for _ in range(10)}
+          & {A.generate_request_id("uid-b") for _ in range(10)}) == 0)
+
+# --- 45.3 出站 UA 必须是官方客户端 UA，绝不能是 Go 默认值 ---
+_acc45 = A.Account({"uid": "ua-test", "realm": "cn", "accessToken": "dt-x",
+                    "refreshToken": "drt-x", "expiresAt": 9999999999})
+_h_cn45 = _acc45.headers()
+_acc45.realm = "intl"
+_h_intl45 = _acc45.headers()
+_acc45.realm = "cn"
+check("#45-11 CN 出站 UA = 官方 QoderWork 客户端 UA（不是 Go-http-client）",
+      _h_cn45["User-Agent"].startswith("QoderWork/")
+      and "Go-http-client" not in _h_cn45["User-Agent"],
+      _h_cn45["User-Agent"])
+check("#45-12 INTL 出站 UA = 官方 Qoder 客户端 UA（不是 Go-http-client）",
+      _h_intl45["User-Agent"].startswith("Qoder/")
+      and "Go-http-client" not in _h_intl45["User-Agent"],
+      _h_intl45["User-Agent"])
+check("#45-13 两个区域的 UA 不同（按区域取，不是同一常量）",
+      _h_cn45["User-Agent"] != _h_intl45["User-Agent"],
+      (_h_cn45["User-Agent"], _h_intl45["User-Agent"]))
+check("#45-14 headers() 携带的 X-Machine-ID 是 UUID 形状",
+      bool(_UUID4_45.match(_h_cn45["X-Machine-ID"])), _h_cn45["X-Machine-ID"])
+check("#45-15 headers() 每次调用的 X-Request-ID 都不同（重试不会复用同一 id）",
+      _acc45.headers()["X-Request-ID"] != _acc45.headers()["X-Request-ID"])
+
+# --- 45.16 源码级守卫：出站头里不得再出现硬编码 Go UA ---
+_src_acc45 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "qoder_accounts.py"), encoding="utf-8").read()
+check("#45-16 Account.headers()/_post_token() 不再硬编码 CLIENT_UA（改按区域取 cfg['ua']）",
+      _src_acc45.count('"User-Agent": CLIENT_UA') == 0,
+      _src_acc45.count('"User-Agent": CLIENT_UA'))
+check("#45-17 CLIENT_UA 仍保留为兜底常量（不删，避免外部引用断裂）",
+      'CLIENT_UA = "Go-http-client/2.0"' in _src_acc45)
 
 print()
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed, %d skipped"

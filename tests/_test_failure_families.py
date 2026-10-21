@@ -224,18 +224,18 @@ check("B1 直连 429 -> note_soft_rate x2（每号一次）且 model 级 note_er
       and got["note_error"] >= 1, (got, type(err).__name__ if err else None))
 
 got, err, _ = _run_case(_raiser(_http_error(500, "boom")))
-check("B2 HTTP 500（瞬时重试耗尽）-> note_failure x2",
-      got["failure"] == 2 and got["soft"] == 0 and got["unknown"] == 0,
+check("B2 HTTP 500（全池同样失败）-> 三族零调用（全池同样失败，不归咎账号）",
+      got["failure"] == 0 and got["soft"] == 0 and got["unknown"] == 0,
       (got, type(err).__name__ if err else None))
 
 got, err, _ = _run_case(_raiser(urllib.error.URLError(ssl.SSLError("EOF"))))
-check("B3 传输抖动（TLS EOF 重试耗尽）-> note_failure x2",
-      got["failure"] == 2 and got["soft"] == 0 and got["unknown"] == 0,
+check("B3 传输抖动（全池同样失败）-> 三族零调用（全池同样失败，不归咎账号）",
+      got["failure"] == 0 and got["soft"] == 0 and got["unknown"] == 0,
       (got, type(err).__name__ if err else None))
 
 got, err, _ = _run_case(_raiser(ValueError("weird")))
-check("B4 未知异常 -> note_unknown_failure x2",
-      got["unknown"] == 2 and got["soft"] == 0 and got["failure"] == 0,
+check("B4 未知异常（全池同样失败）-> 三族零调用（全池同样失败，不归咎账号）",
+      got["unknown"] == 0 and got["soft"] == 0 and got["failure"] == 0,
       (got, type(err).__name__ if err else None))
 
 got, err, _ = _run_case(_raiser(_http_error(401, "token expired")))
@@ -261,6 +261,79 @@ check("B7 成功 -> note_success x1（复位关键：退避计数靠它归零）
 got, err, _ = _run_case(_raiser(_http_error(429, "too many requests")), n=1)
 check("B8 单号池直连 429 -> 三族零调用（不打死唯一账号）",
       got["soft"] == 0 and got["failure"] == 0 and got["unknown"] == 0, got)
+
+
+# ---- B 段补充（issue #59 跟进）：三族延迟记账 + 请求自身 4xx 不轮换 ----
+def _flaky_first_n(n, make_exc):
+    """前 n 次 urlopen 抛**新建**的异常对象，之后返回 _Resp()（换号后成功）。"""
+    state = {"i": 0}
+
+    def _f(*a, **k):
+        if state["i"] < n:
+            state["i"] += 1
+            raise make_exc()
+        return _Resp()
+    return _f
+
+
+def _counting(make_exc):
+    """每次 urlopen 都抛新建异常，并统计调用次数（验证「不换号」）。"""
+    state = {"n": 0}
+
+    def _f(*a, **k):
+        state["n"] += 1
+        raise make_exc()
+    return _f, state
+
+
+got, err, _ = _run_case(_flaky_first_n(3, lambda: _http_error(500, "boom")))
+check("B9 首号 HTTP 500 x3、次号成功 -> failure x1 + success x1（延迟落账）",
+      got["failure"] == 1 and got["success"] == 1 and got["unknown"] == 0
+      and err is None, (got, type(err).__name__ if err else None))
+
+got, err, _ = _run_case(_flaky_first_n(
+    3, lambda: urllib.error.URLError(ssl.SSLError("EOF"))))
+check("B10 首号传输 EOF x3、次号成功 -> failure x1 + success x1（延迟落账）",
+      got["failure"] == 1 and got["success"] == 1 and got["unknown"] == 0
+      and err is None, (got, type(err).__name__ if err else None))
+
+got, err, _ = _run_case(_flaky_first_n(1, lambda: ValueError("weird")))
+check("B11 首号未知异常 x1、次号成功 -> unknown x1 + success x1（延迟落账）",
+      got["unknown"] == 1 and got["success"] == 1 and got["failure"] == 0
+      and err is None, (got, type(err).__name__ if err else None))
+
+impl, cnt = _counting(lambda: _http_error(
+    400, "InternalError.Algo.DataInspectionFailed: input text data"))
+got, err, _ = _run_case(impl)
+check("B12 400 内容审核 -> 不换号不冷却（urlopen x1、note_error 0、三族 0）",
+      cnt["n"] == 1 and got["note_error"] == 0 and got["soft"] == 0
+      and got["failure"] == 0 and got["unknown"] == 0
+      and isinstance(err, urllib.error.HTTPError) and err.code == 400,
+      (got, cnt["n"], type(err).__name__ if err else None))
+
+impl, cnt = _counting(lambda: _http_error(
+    400, "invalid_parameter_error: Range of max_tokens"))
+got, err, _ = _run_case(impl)
+check("B13 400 invalid_parameter_error -> 不换号不冷却（同 B12 契约）",
+      cnt["n"] == 1 and got["note_error"] == 0 and got["soft"] == 0
+      and got["failure"] == 0 and got["unknown"] == 0
+      and isinstance(err, urllib.error.HTTPError) and err.code == 400,
+      (got, cnt["n"], type(err).__name__ if err else None))
+
+impl, cnt = _counting(lambda: _http_error(413, "payload too large: 1 > 0"))
+got, err, _ = _run_case(impl)
+check("B14 413 -> 不换号不冷却（urlopen x1、note_error 0、三族 0）",
+      cnt["n"] == 1 and got["note_error"] == 0 and got["soft"] == 0
+      and got["failure"] == 0 and got["unknown"] == 0
+      and isinstance(err, urllib.error.HTTPError) and err.code == 413,
+      (got, cnt["n"], type(err).__name__ if err else None))
+
+impl, cnt = _counting(lambda: _http_error(402, "insufficient balance"))
+got, err, _ = _run_case(impl)
+check("B15 402 仍换号冷却（urlopen == 账号数、note_error >= 1、三族 0）",
+      cnt["n"] == 2 and got["note_error"] >= 1 and got["soft"] == 0
+      and got["failure"] == 0 and got["unknown"] == 0,
+      (got, cnt["n"], type(err).__name__ if err else None))
 
 print("")
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed" % (PASS + FAIL, PASS, FAIL))

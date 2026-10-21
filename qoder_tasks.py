@@ -394,7 +394,7 @@ def _campaign_task_row(account, camp, summary):
             "reward_energy": 0,
         }
     desc = ("当前账号暂无可参与的官方活动（每日 100 为定向下发：常见原因——账号未在"
-            "活动定向内、虚拟机环境、试用资格已用尽/冻结；详见 README「活动与新人权益规则」）")
+            "活动定向内、虚拟机环境、试用资格已用尽/冻结；详见 docs/accounts.md「官方活动规则」）")
     if camp.get("show_campaign"):
         desc = "活动进行中，当前账号暂无可领取项"
     return {

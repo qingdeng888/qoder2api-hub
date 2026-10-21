@@ -17,6 +17,7 @@
 """
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -37,10 +38,15 @@ CYCLE_MANUAL = "manual"
 class Scheduler(object):
     def __init__(self, pool, state_dir=None):
         self.pool = pool
-        # 对齐社区默认排程 (本地时区 24 小时制)
-        self.checkin_hours = [9, 21]     # 每日 09:00、21:00 签到
-        self.keepalive_hours = [22]      # 每日 22:00 集中 Token 保活
-        self.all_hours = sorted(set(self.checkin_hours + self.keepalive_hours))
+        # issue #70：排程可配置（默认仍是 09:00 / 21:00 签到、22:00 保活）。
+        # 旧实现靠「每分钟轮询 cur_min == 0」命中整点：容器时区与宿主机不同、
+        # 或上一轮巡检跑过 1 分钟，就会**整点漏掉**——用户看到的就是「签到无效」。
+        self.checkin_times = []          # [(hour, minute), ...]
+        self.keepalive_times = []
+        self.cron = ""                   # 可选：5 段 cron，覆盖 checkin_times
+        self.jitter_secs = 8             # 账号之间的随机间隔上限（秒）
+        self._fired = {}                 # target_ts -> True（已触发过）
+        self._apply_schedule({})
         self._stop_event = threading.Event()
         self._thread = None
         self._run_lock = threading.Lock()
@@ -52,6 +58,7 @@ class Scheduler(object):
         self._state_lock = threading.Lock()
         st = self._load_state()
         self.enabled = bool(st.get("enabled", True))   # 看板开关重启后仍生效
+        self._apply_schedule(st)                        # issue #70：排程配置持久化
         self.last_run_time = st.get("last_run_time") or None
         self.next_run_time = None
         self.logs = [str(x) for x in (st.get("logs") or [])][-60:]
@@ -65,6 +72,167 @@ class Scheduler(object):
             self.log("调度器状态已从 %s 恢复（enabled=%s，上次运行 %s）"
                      % (self._state_path(), self.enabled,
                         self.last_run_time or "-"))
+
+    # -- 排程解析（issue #70） ----------------------------------------------
+    @staticmethod
+    def _parse_times(value, fallback):
+        """"09:00,21:30" -> [(9,0),(21,30)]；非法项忽略，全非法用 fallback。"""
+        out = []
+        for chunk in str(value or "").split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            m = re.match(r"^(\d{1,2}):(\d{2})$", chunk)
+            if not m:
+                continue
+            h, mi = int(m.group(1)), int(m.group(2))
+            if 0 <= h <= 23 and 0 <= mi <= 59:
+                out.append((h, mi))
+        return sorted(set(out)) or list(fallback)
+
+    @staticmethod
+    def _fmt_times(times):
+        return ",".join("%02d:%02d" % t for t in times)
+
+    @staticmethod
+    def _cron_field(spec, lo, hi):
+        """单段 cron -> set(int)；非法返回 None。支持 * / a-b / a,b / */n / a-b/n。"""
+        out = set()
+        for part in str(spec or "").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            step = 1
+            has_step = "/" in part
+            if has_step:
+                part, _, s_step = part.partition("/")
+                try:
+                    step = max(1, int(s_step))
+                except Exception:
+                    return None
+            if part == "*":
+                rng = range(lo, hi + 1)
+            elif "-" in part:
+                a, _, b = part.partition("-")
+                try:
+                    a, b = int(a), int(b)
+                except Exception:
+                    return None
+                if a > b:
+                    a, b = b, a
+                rng = range(max(lo, a), min(hi, b) + 1)
+            else:
+                try:
+                    v = int(part)
+                except Exception:
+                    return None
+                if v < lo or v > hi:
+                    return None
+                # 关键：单个值只是「这一个」。只有显式 step（写成 9/6）才展开
+                # 成「从 9 到上限每 6」——否则 "9,21" 会退化成 9..23 全命中。
+                rng = range(v, hi + 1) if has_step else [v]
+            out.update(x for x in rng if (x - lo) % step == 0)
+        return out or None
+
+    def _cron_fields(self):
+        parts = str(self.cron or "").split()
+        if len(parts) != 5:
+            return None
+        minute = self._cron_field(parts[0], 0, 59)
+        hour = self._cron_field(parts[1], 0, 23)
+        dom = self._cron_field(parts[2], 1, 31)
+        mon = self._cron_field(parts[3], 1, 12)
+        dow = self._cron_field(parts[4], 0, 6)
+        if None in (minute, hour, dom, mon, dow):
+            return None
+        return minute, hour, dom, mon, dow
+
+    def _cron_matches(self, tm):
+        f = self._cron_fields()
+        if not f:
+            return False
+        minute, hour, dom, mon, dow = f
+        if tm.tm_min not in minute or tm.tm_hour not in hour:
+            return False
+        if tm.tm_mon not in mon:
+            return False
+        if tm.tm_mday not in dom:
+            return False
+        return ((tm.tm_wday + 1) % 7) in dow     # Python 0=周一 -> cron 0=周日
+
+    def _occurrences(self, day_offset):
+        """某一天的所有排程时刻 -> [(kind, label, ts)]。"""
+        base = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
+        base += day_offset * 86400
+        out = []
+        if self.cron:
+            start = time.localtime(base)
+            for i in range(24 * 60):
+                ts = base + i * 60
+                tm = time.localtime(ts)
+                if tm.tm_mday != start.tm_mday and i > 0:
+                    break
+                if self._cron_matches(tm):
+                    out.append((CYCLE_HOUR, "cron %02d:%02d" % (tm.tm_hour, tm.tm_min),
+                                ts))
+        else:
+            for (h, mi) in self.checkin_times:
+                ts = base + h * 3600 + mi * 60
+                out.append((CYCLE_HOUR, "签到期 %02d:%02d" % (h, mi), ts))
+        for (h, mi) in self.keepalive_times:
+            ts = base + h * 3600 + mi * 60
+            out.append((CYCLE_HOUR, "保活期 %02d:%02d" % (h, mi), ts))
+        return out
+
+    def _next_target(self):
+        """下一个应触发但还没触发的排程时刻 -> (kind, label, ts) 或 None。"""
+        now = time.time()
+        cands = []
+        for off in (-1, 0, 1):
+            cands.extend(self._occurrences(off))
+        cands.sort(key=lambda x: x[2])
+        for kind, label, ts in cands:
+            if ts > now:
+                break
+            if ts in self._fired:
+                continue
+            if now - ts > 3 * 3600:      # 超过 3 小时的历史点不再补跑
+                self._fired[ts] = True
+                continue
+            return kind, label, ts
+        return None
+
+    def _apply_schedule(self, st):
+        self.checkin_times = self._parse_times(st.get("checkin_times"),
+                                              [(9, 0), (21, 0)])
+        self.keepalive_times = self._parse_times(st.get("keepalive_times"),
+                                                [(22, 0)])
+        self.cron = str(st.get("cron") or "").strip()
+        if self.cron and not self._cron_fields():
+            self.log("排程 cron 表达式无效，已忽略: %s" % self.cron)
+            self.cron = ""
+        try:
+            self.jitter_secs = max(0, min(60, int(st.get("jitter_secs") or 8)))
+        except Exception:
+            self.jitter_secs = 8
+        self._fired = {}
+        self._calc_next_fire()
+
+    def set_schedule(self, checkin_times=None, keepalive_times=None,
+                     cron=None, jitter_secs=None):
+        """面板改排程（issue #70）：校验后套用并落盘。"""
+        st = {
+            "checkin_times": checkin_times if checkin_times is not None
+            else self._fmt_times(self.checkin_times),
+            "keepalive_times": keepalive_times if keepalive_times is not None
+            else self._fmt_times(self.keepalive_times),
+            "cron": cron if cron is not None else self.cron,
+            "jitter_secs": jitter_secs if jitter_secs is not None
+            else self.jitter_secs,
+        }
+        self._apply_schedule(st)
+        self._save_state()
+        return self.status()
 
     # -- 状态持久化 ---------------------------------------------------------
     def _state_path(self):
@@ -91,6 +259,10 @@ class Scheduler(object):
                 tmp = path + ".tmp"
                 data = {
                     "enabled": bool(self.enabled),
+                    "checkin_times": self._fmt_times(self.checkin_times),
+                    "keepalive_times": self._fmt_times(self.keepalive_times),
+                    "cron": self.cron,
+                    "jitter_secs": self.jitter_secs,
                     "last_run_time": self.last_run_time,
                     "next_run_time": self.next_run_time,
                     "startup_claim_date": self.startup_claim_date,
@@ -142,39 +314,35 @@ class Scheduler(object):
         except Exception as exc:
             self.log("初次巡检异常: %s" % exc)
 
+        # issue #70：不再靠「每分钟轮询 cur_min == 0」。旧写法有两个必漏点：
+        #   1) 容器时区与宿主机不同 -> 命中的是 UTC 的 9 点，不是用户本地 9 点；
+        #   2) 上一轮巡检跑超过 1 分钟 -> 整点那一分钟整个跳过，当天就没了。
+        # 现在改成「到点即补」：每 15s 检查一次「有没有已过点但还没触发的排程」，
+        # 最多回补 3 小时内的漏点（进程重启也接得上）。
         while not self._stop_event.is_set():
-            self._calc_next_fire()
-            now = time.localtime()
-            cur_hour = now.tm_hour
-            cur_min = now.tm_min
             if self.enabled:
-                if cur_min == 0 and cur_hour in self.all_hours:
-                    reason = "整点排程命中 (%d:00)" % cur_hour
+                due = self._next_target()
+                if due is not None:
+                    kind, label, ts = due
+                    self._fired[ts] = True
+                    self._pending_focus = label
                     try:
-                        self._execute_cycle(reason, CYCLE_HOUR)
+                        self._execute_cycle("整点排程命中 (%s)" % label, kind)
                     except Exception as exc:
                         self.log("排程执行异常: %s" % exc)
-                    time.sleep(65)   # 避开当前这一分钟重复触发
-            self._stop_event.wait(30)
+            self._stop_event.wait(15)
 
     def _calc_next_fire(self):
-        now = time.localtime()
-        cur_h = now.tm_hour
-        next_h = None
-        for h in self.all_hours:
-            if h > cur_h or (h == cur_h and now.tm_min == 0 and now.tm_sec < 10):
-                next_h = h
-                break
-        if next_h is not None:
-            t_struct = time.struct_time(
-                (now.tm_year, now.tm_mon, now.tm_mday, next_h, 0, 0, 0, 0, -1))
+        now = time.time()
+        cands = []
+        for off in (-1, 0, 1, 2):
+            cands.extend(self._occurrences(off))
+        future = [ts for _k, _l, ts in cands if ts > now + 1]
+        if future:
+            self.next_run_time = time.strftime("%Y-%m-%d %H:%M:%S",
+                                              time.localtime(min(future)))
         else:
-            t_tomorrow = time.time() + 86400
-            now_tom = time.localtime(t_tomorrow)
-            first_h = self.all_hours[0]
-            t_struct = time.struct_time(
-                (now_tom.tm_year, now_tom.tm_mon, now_tom.tm_mday, first_h, 0, 0, 0, 0, -1))
-        self.next_run_time = time.strftime("%Y-%m-%d %H:%M:%S", t_struct)
+            self.next_run_time = None
 
     def trigger_now(self):
         """手动立即触发一次调度检查（不受"启动补签当日一次"闸门限制）。"""
@@ -221,8 +389,16 @@ class Scheduler(object):
             return
 
         cur_hour = time.localtime().tm_hour
-        keepalive_due = cur_hour in self.keepalive_hours
-        checkin_due = cur_hour in self.checkin_hours
+        focus = getattr(self, "_pending_focus", "") or ""
+        self._pending_focus = ""
+        # issue #70：排程可配置后，靠标签判断本轮该做什么（cron 只覆盖签到）。
+        if focus.startswith("保活期"):
+            keepalive_due, checkin_due = True, False
+        elif focus.startswith(("签到期", "cron")):
+            keepalive_due, checkin_due = False, True
+        else:
+            keepalive_due = cur_hour in {h for h, _m in self.keepalive_times}
+            checkin_due = cur_hour in {h for h, _m in self.checkin_times}
         allow_complement = self._allow_complement_checkin(cycle_kind)
 
         # 1. Token 保活：整点 22:00 全量刷新；其余巡检只刷新临近过期的
@@ -289,9 +465,21 @@ class Scheduler(object):
     def status(self):
         return {
             "enabled": self.enabled,
-            "mode": "整点排程 (09:00/21:00 签到 · 22:00 Token 保活)",
-            "mode_cn": "整点排程 (09:00/21:00 每日签到 · 22:00 Token 保活)",
-            "mode_intl": "整点排程 (09:00/21:00 每日签到 · 22:00 Token 保活)",
+            "checkin_times": self._fmt_times(self.checkin_times),
+            "keepalive_times": self._fmt_times(self.keepalive_times),
+            "cron": self.cron,
+            "jitter_secs": self.jitter_secs,
+            "timezone": time.strftime("%Z %z"),
+            "mode": "排程：签到 %s · 保活 %s%s"
+                    % (self._fmt_times(self.checkin_times),
+                       self._fmt_times(self.keepalive_times),
+                       (" · cron %s" % self.cron) if self.cron else ""),
+            "mode_cn": "排程：每日签到 %s · Token 保活 %s"
+                         % (self._fmt_times(self.checkin_times),
+                            self._fmt_times(self.keepalive_times)),
+            "mode_intl": "排程：每日签到 %s · Token 保活 %s"
+                           % (self._fmt_times(self.checkin_times),
+                              self._fmt_times(self.keepalive_times)),
             "last_run_time": self.last_run_time or "尚未运行",
             "next_run_time": self.next_run_time or "待调度",
             "startup_claim_date": self.startup_claim_date or "",

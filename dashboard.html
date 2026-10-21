@@ -690,9 +690,31 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <span>后台定时调度器: <b id="schedStatusText">运行中</b></span>
       <span style="color:var(--dim);font-size:11px" id="schedTimes"></span>
     </div>
-    <div style="display:flex;gap:8px">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <button class="sec mini" onclick="toggleSchedEditor()">排程设置</button>
       <button class="sec mini" id="btnTriggerSched" onclick="triggerSchedulerNow(this)">立即巡检保活</button>
       <button class="sec mini" id="btnToggleSched" onclick="toggleScheduler(this)">暂停调度</button>
+    </div>
+    <div id="schedEditor" style="display:none;width:100%;margin-top:8px;padding-top:10px;border-top:1px dashed var(--line)">
+      <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:flex-start">
+        <div id="schedDialWrap" style="flex:0 0 auto"></div>
+        <div style="flex:1;min-width:230px;display:flex;flex-direction:column;gap:10px">
+          <div style="font-size:12px;color:var(--dim)">点圆环上的刻度选择**整点**；再点一次取消。签到与保活分开设置。</div>
+          <div id="schedSummary" style="font-size:12px;color:var(--fg)"></div>
+          <label style="font-size:12px;color:var(--dim)">账号间隔抖动
+            <input id="schJitter" placeholder="8" style="width:70px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:4px 8px;font:inherit;color:var(--fg)">
+            秒
+          </label>
+          <details>
+            <summary style="cursor:pointer;font-size:12px;color:var(--dim)">高级：用 cron 表达式（覆盖签到时刻）</summary>
+            <input id="schCron" placeholder="0 9,21 * * *" style="width:100%;margin-top:6px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit;color:var(--fg)">
+          </details>
+          <div style="display:flex;gap:8px;align-items:center">
+            <button class="sec mini" onclick="saveSchedule(this)">保存排程</button>
+            <span style="font-size:11px;color:var(--dim)">保存后立即生效；时区见状态行</span>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -1753,9 +1775,12 @@ async function loadUpdateState(force, btn){
       state.innerHTML = '发现新版本 <b style="color:var(--accent)">' + esc(r.latest) + '</b>'
         + '（当前 ' + esc(r.current) + '）';
       state.style.color = 'var(--accent)';
-      if(actions && r.url){
-        actions.innerHTML = '<a href="' + esc(r.url) + '" target="_blank" rel="noopener" '
-          + 'style="color:var(--accent);text-decoration:underline">前往 Releases 下载升级 →</a>';
+      if(actions){
+        actions.innerHTML = '<button class="sec" style="font-size:11px;padding:3px 10px;'
+          + 'margin-right:10px;background:var(--accent);color:#fff;border-color:var(--accent)" '
+          + 'onclick="applyUpdate(this)">一键更新</button>'
+          + (r.url ? ('<a href="' + esc(r.url) + '" target="_blank" rel="noopener" '
+          + 'style="color:var(--dim);text-decoration:underline">发布说明 →</a>') : '');
       }
       setUpdateBadge(r);      // 顶部徽标提醒升级
     } else {
@@ -1775,6 +1800,56 @@ async function loadUpdateState(force, btn){
   }
 }
 
+
+// —— 一键更新（下载官方 release -> 校验 -> 备份 -> 替换 -> 自动重启）——
+async function applyUpdate(btn){
+  if(!confirm('将下载官方最新版本并自动重启网关。\n\n更新前会自动备份当前代码到 backups/，失败会回滚。确认继续？')) return;
+  const state = document.getElementById('updateState');
+  const actions = document.getElementById('updateActions');
+  if(btn){ btn.disabled = true; btn.textContent = '更新中…'; }
+  const setState = (txt, color) => { if(state){ state.textContent = txt; state.style.color = color || 'var(--accent)'; } };
+  setState('正在下载并校验新版本（通常几秒）…');
+  try{
+    const r = await postJSON('/update/apply', {});
+    if(!r || r.ok === false){
+      setState('更新失败：' + ((r && r.error) || '未知错误'), 'var(--warn)');
+      if(btn){ btn.disabled = false; btn.textContent = '一键更新'; }
+      return;
+    }
+    setState('已更新 ' + esc(r.from || '') + ' → ' + esc(r.to || '') + '，正在重启…');
+    if(actions) actions.innerHTML = '<span style="color:var(--dim)">等待新进程就绪…</span>';
+    await waitForRestart(r.to);
+  }catch(e){
+    const msg = String((e && e.message) || e);
+    if(/Failed to fetch|NetworkError|load failed/i.test(msg)){
+      // 进程已经在重启：继续走等待逻辑，而不是当成失败
+      setState('重启中…');
+      await waitForRestart('');
+      return;
+    }
+    setState('更新失败：' + msg, 'var(--warn)');
+    if(btn){ btn.disabled = false; btn.textContent = '一键更新'; }
+  }
+}
+
+async function waitForRestart(expect){
+  const state = document.getElementById('updateState');
+  const deadline = Date.now() + 90000;
+  while(Date.now() < deadline){
+    await new Promise(r => setTimeout(r, 1500));
+    try{
+      const h = await getJSON('/health');
+      const v = (h && (h.version || (h.data && h.data.version))) || '';
+      if(v && (!expect || v === String(expect).replace(/^v/i, ''))){
+        location.reload();
+        return;
+      }
+      if(state){ state.textContent = '新进程已就绪（' + v + '），刷新中…'; }
+    }catch(e){ /* 进程还没起来，继续等 */ }
+  }
+  if(state){ state.textContent = '更新已完成，但自动刷新超时——请手动刷新页面。';
+             state.style.color = 'var(--warn)'; }
+}
 async function switchViewRealm(r){
   if(window.VIEW_REALM === r) return;
   window.VIEW_REALM = r;
@@ -2420,6 +2495,120 @@ async function triggerCatTravel(btn){
   }
 }
 
+
+
+// issue #70 后续：24 小时刻度圆环选时刻（取代手写 "09:00,21:00" 文本）
+const SCHED = {mode: "checkin", checkin: [], keepalive: [], jitter: 8, cron: ""};
+
+function _schedParse(times){
+  return String(times || "").split(",").map(s => s.trim()).filter(Boolean)
+    .map(s => parseInt(s.split(":")[0], 10)).filter(h => h >= 0 && h <= 23);
+}
+
+function _schedFmt(hours){
+  return Array.from(new Set(hours)).sort((a,b) => a-b)
+    .map(h => String(h).padStart(2, "0") + ":00").join(",");
+}
+
+function _dialPath(h, r1, r2, cx, cy){
+  const step = 15, pad = 1.4;
+  const a1 = (h * step + pad) * Math.PI / 180 - Math.PI / 2;
+  const a2 = ((h + 1) * step - pad) * Math.PI / 180 - Math.PI / 2;
+  const pt = (r, a) => [ (cx + r * Math.cos(a)).toFixed(2), (cy + r * Math.sin(a)).toFixed(2) ];
+  const [x1,y1] = pt(r2, a1), [x2,y2] = pt(r2, a2);
+  const [x3,y3] = pt(r1, a2), [x4,y4] = pt(r1, a1);
+  return "M" + x1 + "," + y1 + " A" + r2 + "," + r2 + " 0 0 1 " + x2 + "," + y2
+       + " L" + x3 + "," + y3 + " A" + r1 + "," + r1 + " 0 0 0 " + x4 + "," + y4 + " Z";
+}
+
+function renderSchedDial(){
+  const box = document.getElementById("schedDialWrap");
+  if(!box) return;
+  const sel = SCHED[SCHED.mode] || [];
+  const cx = 118, cy = 118, r2 = 104, r1 = 66;
+  let segs = "";
+  for(let h = 0; h < 24; h++){
+    const on = sel.indexOf(h) >= 0;
+    segs += '<path d="' + _dialPath(h, r1, r2, cx, cy) + '" '
+         + 'onclick="toggleSchedHour(' + h + ')" style="cursor:pointer;stroke:var(--line);stroke-width:1" '
+         + 'fill="' + (on ? "var(--accent)" : "var(--panel2)") + '" opacity="' + (on ? "0.9" : "0.75") + '">'
+         + '<title>' + String(h).padStart(2,"0") + ':00</title></path>';
+  }
+  let labels = "";
+  [[0,"0"],[6,"6"],[12,"12"],[18,"18"]].forEach(([h, txt]) => {
+    const a = h * 15 * Math.PI / 180 - Math.PI / 2;
+    const x = cx + 116 * Math.cos(a), y = cy + 116 * Math.sin(a) + 4;
+    labels += '<text x="' + x.toFixed(1) + '" y="' + y.toFixed(1) + '" text-anchor="middle" '
+            + 'font-size="11" fill="var(--dim)">' + txt + "</text>";
+  });
+  const tabs = [["checkin","签到"], ["keepalive","保活"]].map(([k, lbl]) =>
+    '<button class="sec mini" onclick="switchSchedMode(\'' + k + '\')" '
+    + 'style="padding:3px 12px;margin-right:6px;font-size:12px'
+    + (SCHED.mode === k ? ";background:var(--accent);color:#fff;border-color:var(--accent)" : "")
+    + '">' + lbl + ' <span style="opacity:.75">' + ((SCHED[k]||[]).length) + "</span></button>"
+  ).join("");
+  box.innerHTML = '<div style="margin-bottom:6px">' + tabs + "</div>"
+    + '<svg width="236" height="236" viewBox="0 0 236 236" style="display:block">'
+    + segs + labels
+    + '<circle cx="118" cy="118" r="34" fill="none" stroke="var(--line)"></circle>'
+    + '<text x="118" y="114" text-anchor="middle" font-size="12" fill="var(--dim)">'
+    + (SCHED.mode === "checkin" ? "签到" : "保活") + "</text>"
+    + '<text x="118" y="132" text-anchor="middle" font-size="13" fill="var(--fg)" font-weight="600">'
+    + ((sel||[]).length ? String((sel||[]).length) + " 个整点" : "未选择") + "</text></svg>";
+  const sum = document.getElementById("schedSummary");
+  if(sum){
+    sum.innerHTML = "签到：<b>" + (_schedFmt(SCHED.checkin) || "未设置") + "</b>"
+      + "　　保活：<b>" + (_schedFmt(SCHED.keepalive) || "未设置") + "</b>";
+  }
+}
+
+function switchSchedMode(m){ SCHED.mode = m; renderSchedDial(); }
+
+function toggleSchedHour(h){
+  const list = SCHED[SCHED.mode] || [];
+  const i = list.indexOf(h);
+  if(i >= 0) list.splice(i, 1); else list.push(h);
+  SCHED[SCHED.mode] = list;
+  renderSchedDial();
+}
+function toggleSchedEditor(){
+  const box = document.getElementById("schedEditor");
+  if(!box) return;
+  const showing = (box.style.display === "none" || !box.style.display);
+  box.style.display = showing ? "block" : "none";
+  if(showing) renderSchedDial();
+}
+
+async function saveSchedule(btn){
+  const g = id => ((document.getElementById(id) || {}).value || "").trim();
+  const checkin = _schedFmt(SCHED.checkin);
+  const keepalive = _schedFmt(SCHED.keepalive);
+  const cron = g("schCron");
+  if(!checkin && !cron){
+    toast("请先点圆环选一个签到时刻（或填 cron）", "warn");
+    return;
+  }
+  if(!keepalive){
+    toast("请先点圆环选一个保活时刻", "warn");
+    return;
+  }
+  if(btn){ btn.disabled = true; btn.textContent = "保存中…"; }
+  try{
+    const r = await postJSON("/scheduler/config", {
+      checkin_times: checkin,
+      keepalive_times: keepalive,
+      cron: cron,
+      jitter_secs: g("schJitter"),
+    });
+    const s = r.scheduler || {};
+    toast("排程已保存：签到 " + (s.checkin_times || "-") + " · 保活 " + (s.keepalive_times || "-"), "ok");
+    loadSchedulerStatus();
+  }catch(e){
+    toast("保存失败: " + ((e && e.message) || e), "bad");
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = "保存排程"; }
+  }
+}
 async function loadSchedulerStatus(){
   try{
     const s = await getJSON("/scheduler");
@@ -2436,7 +2625,25 @@ async function loadSchedulerStatus(){
       ? (s.mode_intl || '账号 Token 自动保活与凭证常驻 (每日 22:00 集中巡检)')
       : (s.mode_cn || s.mode || '整点排程');
     if(txt) txt.textContent = s.enabled ? ('运行中 · ' + modeText) : '已暂停';
-    if(times) times.textContent = '上次: ' + (s.last_run_time || '-') + ' · 下次: ' + (s.next_run_time || '-');
+    if(times){
+      // issue #70：把排程时刻与时区摆出来——容器跑 UTC 时一眼能看出对不上
+      times.textContent = '签到 ' + (s.checkin_times || '-')
+        + ' · 保活 ' + (s.keepalive_times || '-')
+        + (s.cron ? (' · cron ' + s.cron) : '')
+        + ' · 时区 ' + (s.timezone || '-')
+        + ' · 上次 ' + (s.last_run_time || '-')
+        + ' · 下次 ' + (s.next_run_time || '-');
+      // issue #70 后续：从服务端同步到圆环状态（保留用户正在编辑的选择）
+      if(!window._schedDirty){
+        SCHED.checkin = _schedParse(s.checkin_times);
+        SCHED.keepalive = _schedParse(s.keepalive_times);
+        const cr = document.getElementById('schCron');
+        if(cr) cr.value = s.cron || '';
+        const jt = document.getElementById('schJitter');
+        if(jt) jt.value = s.jitter_secs != null ? String(s.jitter_secs) : '';
+        renderSchedDial();
+      }
+    }
     if(btn) btn.textContent = s.enabled ? '暂停调度' : '启用调度';
     // 按钮文案固定「立即巡检保活」：巡检同时覆盖两个区域（保活+签到+积分），
   // 按当前视图改文案只会让人以为「切区后动作不同」。
@@ -2824,24 +3031,15 @@ function accountRow(a){
     else txt = '更新于 ' + esc((a.creditsUpdatedIso || '').slice(5,16) || '未知');
     freshLine = '<div class="mono" style="font-size:10px;color:var(--dim);margin-top:2px">' + txt + '</div>';
   }
-  // 备注：纯本地字段（不上行），用来区分同名的多个号
-  const remark = String(a.remark || '');
-  const remarkLine = remark
-    ? '<div style="font-size:12px;color:var(--accent2);margin-top:2px;word-break:break-word">'
-      + '<span title="备注（仅本地）">📝 ' + esc(remark) + '</span>'
-      + '<button class="sec mini" style="margin-left:6px;padding:0 6px;font-size:10px" '
-      +   'onclick="editAccountRemark(&quot;' + uidAttr + '&quot;, this)">改</button></div>'
-    : '<div style="margin-top:2px"><button class="sec mini" style="padding:0 6px;font-size:10px;color:var(--dim)" '
-      +   'onclick="editAccountRemark(&quot;' + uidAttr + '&quot;, this)">＋ 添加备注</button></div>';
   return '<tr>'
     + '<td style="text-align:center;white-space:nowrap">' + realmBadge + '</td>'
     + '<td style="text-align:left">'
     +   '<div style="font-weight:600;font-size:13px;color:var(--fg)">' + esc(a.nickname) + '</div>'
     + '<div class="mono" style="color:var(--dim);font-size:11px">' + esc(a.uid.slice(0,8)) + ' · ' + esc(a.source) + ' · 到期 ' + esc(a.expiresIn || '?') + '</div>'
-    + remarkLine
     + (window.__autoOffNote || '')
     + (window.__modelCdNote || '')
     + (a.machineId ? ('<div class="mono" style="color:var(--dim);font-size:10px;margin-top:2px" title="由账号UID稳定派生的专属设备码，防多号关联风控">设备码: ' + esc(a.machineId.slice(0,14)) + '...</div>') : '')
+    + (a.note ? ('<div class="hint" style="margin:3px 0 0" title="备注（issue #69）"><span style="color:var(--accent)">备注</span> ' + esc(a.note) + '</div>') : '')
     + err + '</td>'
     + '<td style="text-align:center">' + state + '</td>'
     + '<td style="text-align:center;white-space:nowrap">' + accountGuardBadge(a) + '</td>'
@@ -2855,6 +3053,7 @@ function accountRow(a){
     +     '<button class="sec mini" onclick="toggleAccount(&quot;' + uidAttr + '&quot;,' + (!a.enabled) + ', this)">' + (a.enabled ? '停用' : '启用') + '</button>'
     +     '<button class="sec mini" onclick="testAccount(&quot;' + uidAttr + '&quot;, this)">测试</button>'
     +     '<button class="sec mini" onclick="refreshOne(&quot;' + uidAttr + '&quot;, this)">刷新</button>'
+    +     '<button class="sec mini" onclick="editAccountNote(&quot;' + uidAttr + '&quot;, this)">备注</button>'
     +   '</div>'
     +   '<div style="display:flex;gap:4px;justify-content:center">'
     +     '<button class="sec mini" onclick="exportOne(&quot;' + uidAttr + '&quot;)">导出</button>'
@@ -2864,22 +3063,21 @@ function accountRow(a){
     + '</td></tr>';
 }
 
-async function editAccountRemark(uid, btn){
-  const list = window.ACCOUNTS || [];
-  const account = list.find(a => String(a.uid).startsWith(String(uid))) || {};
-  const current = String(account.remark || '');
-  const input = window.prompt('给这个账号加个备注（仅本地显示，最多 120 字）:', current);
-  if(input === null) return;            // 取消
-  if(btn){ btn.disabled = true; }
+// issue #69：账号备注（纯展示字段，服务端 /accounts/note）
+async function editAccountNote(uid, btn){
+  const acc = (window.ACCOUNTS || []).find(a => String(a.uid) === String(uid));
+  const cur = acc && acc.note ? acc.note : "";
+  const val = prompt("给这个账号加个备注（比如「公司团队号」「备用」）：", cur);
+  if(val === null) return;
+  if(btn){ btn.disabled = true; btn.textContent = "保存中…"; }
   try{
-    const r = await postJSON('/accounts/remark', {uid: account.uid || uid, remark: input});
-    if(r.accounts) window.ACCOUNTS = r.accounts;
+    const r = await postJSON("/accounts/note", {uid: uid, note: String(val || "").slice(0, 120)});
+    if(acc) acc.note = r.note || "";
     renderAccounts();
-    toast(input.trim() ? '备注已保存' : '备注已清除', 'ok');
+    toast("备注已保存", "ok");
   }catch(e){
-    toast('保存备注失败: ' + e.message, 'bad');
-  }finally{
-    if(btn){ btn.disabled = false; }
+    toast("保存失败: " + ((e && e.message) || e), "bad");
+    if(btn){ btn.disabled = false; btn.textContent = "备注"; }
   }
 }
 
@@ -3901,6 +4099,7 @@ async function loadSettings(showToast){
     // Rebuild the editable rows, keeping stored values so an untouched field
     // is not accidentally blanked.
     API_KEY_ROWS = (data.api_keys || []).map(k => ({
+    note: k.note || '',
       id: k.id || '',
       name: k.name || '',
       key: '',
@@ -4004,6 +4203,11 @@ function renderKeyRows(){
         +     '</select>'
         +   '</div>'
         +   '<div style="grid-column:1 / -1">'
+        +     '<div style="font-size:12px;color:var(--dim);margin-bottom:4px;font-weight:500">备注（可选，长说明）</div>'
+        +     '<input type="text" id="editKeyNote_' + i + '" value="' + esc(row.note || '') + '" placeholder="如: 给团队 A 用 / 每月限额 500 万 token" '
+        +       'style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:inherit;color:var(--fg)">'
+        +   '</div>'
+        +   '<div style="grid-column:1 / -1">'
         +     '<div style="font-size:12px;color:var(--dim);margin-bottom:4px;font-weight:500">API Key 内容 ' + (row.masked ? '<span style="color:var(--dim-light)">(已保存: ' + esc(row.masked) + '，留空表示不改)</span>' : '') + '</div>'
         +     '<div style="display:flex;gap:8px">'
         +       '<input type="text" id="editKeyValue_' + i + '" value="' + esc(row.key || '') + '" placeholder="' + (row.masked ? '留空表示保持原 Key 不变' : '输入自定义密钥，或点击右侧生成') + '" '
@@ -4044,6 +4248,7 @@ function renderKeyRows(){
       +       '<span>Key: <span class="mono" style="color:var(--fg);font-weight:500">' + esc(displayKey) + '</span></span>'
       +       (createdStr ? ('<span>' + createdStr + '</span>') : '')
       +     '</div>'
+      +     (row.note ? ('<div style="font-size:12px;color:var(--accent);margin-top:6px" title="备注">' + esc(row.note) + '</div>') : '')
       +   '</div>'
       +   '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
       +     '<button class="key-action-btn" id="copyBtn' + i + '" onclick="copyKeyRow(' + i + ')">复制</button>'
@@ -4085,10 +4290,12 @@ async function saveSingleKey(index, btn){
   const nameInput = document.getElementById('editKeyName_' + index);
   const realmSelect = document.getElementById('editKeyRealm_' + index);
   const keyInput = document.getElementById('editKeyValue_' + index);
+  const noteInput = document.getElementById('editKeyNote_' + index);
 
   const name = nameInput ? nameInput.value.trim() : (row.name || '');
   const realm = realmSelect ? realmSelect.value : (row.realm || '');
   const keyVal = keyInput ? keyInput.value.trim() : (row.key || '');
+  const note = noteInput ? noteInput.value.trim() : (row.note || '');
 
   if(!keyVal && !row.masked){
     toast('API Key 不能为空', 'warn');
@@ -4097,6 +4304,7 @@ async function saveSingleKey(index, btn){
 
   row.name = name || '未命名';
   row.realm = realm;
+  row.note = note;
   if(keyVal) row.key = keyVal;
   row._editing = false;
 
@@ -4205,6 +4413,7 @@ async function saveApiKeys(btn){
     enabled: row.enabled !== false,
     // Blank means "keep the stored key", which the server honours per row.
     key: (row.key || '').trim(),
+    note: (row.note || '').trim(),
   }));
   const newRow = API_KEY_ROWS.find(row => !row.masked && !(row.key || '').trim());
   if(newRow){

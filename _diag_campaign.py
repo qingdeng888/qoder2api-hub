@@ -30,7 +30,7 @@ import qoder_accounts as A   # noqa: E402
 import qoder_proxy as P      # noqa: E402
 
 RULES = """
-官方规则速查（详见 README「活动与新人权益规则」）：
+官方规则速查（详见 docs/accounts.md「官方活动规则」）：
   · 每日 100 Credits：每账号每轮限领一次（按账号，不是按设备）；每日 10:00
     （UTC+8）刷新，错过不补；30 天有效；仅桌面端可领；新老个人用户均可。
   · 新人 300（14 天 Pro 试用的一部分）：首次登录最新版桌面客户端时发放；
