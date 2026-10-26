@@ -22,6 +22,16 @@
 - 指定区域：`X-Realm: cn|intl` 请求头，或 `?realm=` 查询参数
 - 实际走的区域会写进响应头 `X-Qoder-Realm`；如果发生了自动切换，切换原因写进 `X-Qoder-Realm-Reason`
 
+## 输出上限（max_tokens）
+
+官方模型清单里没有 `maxOutputTokens`，但上游对超限请求会回 `400 invalid_parameter_error: Range of max_tokens should be [1, 131072]`。网关把这行错误当成**学习信号**：
+
+- 解析出 `N` 后按 `(区域, 模型)` 记住并落盘到 `usage/max-output-limits.json`（7 天 TTL）；
+- 之后的请求若 `max_tokens`（含 `/v1/responses` 的 `max_output_tokens`）超过 `N`，**自动压到 `N`** 并打一条 WARN，不再让客户端吃 400；
+- `/v1/models` 会补上 `max_output_tokens` / `max_completion_tokens`，客户端可以自己先算。
+
+也就是说：**第一次**超限仍会看到上游那条 400（网关要靠它才知道上限），之后同一模型就不会了。
+
 ## 探活与状态
 
 | 方法 | 路径 | 鉴权 | 说明 |
@@ -113,6 +123,7 @@
 |---|---|---|
 | `GET /pricing` | 参考价目表（USD / 1M tokens）+ 未定价模型清单 | `qoder_pricing.DEFAULT_PRICES` + `usage/pricing-overrides.json` |
 | `GET /accounts/credits/grants` | 积分包 / 获取记录（面额、剩余、已用） | 最近一次积分快照（**不发上游请求**） |
+| `GET /accounts/credits/usage` | 官方积分消耗：累计 / 单日峰值 / 近 365 天逐日消耗 | 上游 `credits-summary` + `credits-heatmap`（0.4.3 客户端接口），每账号缓存 5 分钟；`?uid=` / `?realm=` 可过滤 |
 | `GET /usage/remaining` | 每账号剩余积分 + 近 24h 消耗 + 预计可用天数 | `usage.jsonl` + 账号积分 |
 | `GET /accounts/activity` | 签到 / 领取动作流水（30 天保留） | `usage/activity.jsonl` |
 

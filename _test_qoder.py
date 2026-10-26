@@ -30,9 +30,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("ACCOUNTS_DIR",
                       os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    "_acc"))
-os.environ.setdefault("USAGE_DIR",
+# 用量目录跟账号目录一起隔离：本文件会被 tests/_test_legacy.py 用 subprocess
+# 起进程跑，环境变量名写错（曾写成 "USAGE_DIR"）会让隔离静默失效，测试流量
+# 全落进线上 usage/usage.jsonl —— 看板上多出一堆「账号=-、Key=历史行未记录」
+# 的失败行。目录与 tests/run_all.py 清理的 _acc/usage 保持一致。
+os.environ.setdefault("QD_PROXY_USAGE_DIR",
                       os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                   "_use"))
+                                   "_acc", "usage"))
 # 离线测试不拉起客户端原生二进制（活动平台的机器身份桥）；测试里显式关闭
 os.environ.setdefault("QD_NATIVE_IDENTITY", "0")
 
@@ -1714,7 +1718,20 @@ print()
 print("[20] campaign check-in (the real daily-claim API) + effort normalization")
 
 # --- 20.1 桌面端请求头（活动平台必需；缺了服务端返回空列表） ---
-_hdrs = _t_cn.desktop_headers()
+# 环境无关的 derived 预置：官方客户端现在会随包提供 resources/umid/runtime-info.exe，
+# 且落盘身份缓存优先命中——本机身份可能已是 runtime-info，那样「derived 不发机器头」
+# 这条断言就没法在真实环境里成立。这里显式把身份来源钉成 derived 再验证。
+_orig_nmi20d = A.native_machine_identity
+_orig_exe20d = A.runtime_info_exe
+A.runtime_info_exe = lambda realm: ""
+A.native_machine_identity = lambda realm, account_id, force=False: None
+try:
+    _t_cn_derived20 = A.Account({"uid": "derived-h20", "realm": "cn",
+                                "accessToken": "dt-x"})
+    _hdrs = _t_cn_derived20.desktop_headers()
+finally:
+    A.native_machine_identity = _orig_nmi20d
+    A.runtime_info_exe = _orig_exe20d
 check("desktop headers carry Cosy-ClientType=10 + Cosy-Version + UA Qoder",
       _hdrs["cosy-clienttype"] == "10" and _hdrs["User-Agent"] == "Qoder"
       and bool(_hdrs["cosy-version"]), _hdrs.get("cosy-clienttype"))
@@ -1730,11 +1747,10 @@ check("derived 身份不得发送 cosy-machine* 六头（issue #10：全套派�
       "过滤掉可领取的 Credits 活动）",
       not any(_hdrs.get(k) for k in _MACHINE_HDRS20),
       {k: _hdrs.get(k) for k in _MACHINE_HDRS20 if _hdrs.get(k)})
-check("native identity bridge can be disabled (derived fallback)",
+check("native identity bridge 可被关掉（derived 回退）",
       os.environ.get("QD_NATIVE_IDENTITY") == "0"
-      and _t_cn.machine_identity_source == "derived"
-      and A.runtime_info_exe("cn") == "",
-      _t_cn.machine_identity_source)
+      and _t_cn_derived20.machine_identity_source == "derived",
+      _t_cn_derived20.machine_identity_source)
 check("desktop headers keep the Bearer token",
       _hdrs["Authorization"].startswith("Bearer "))
 # issue #10 的正向面：修复只能收窄 derived，**native 原生身份必须照旧发六头**。

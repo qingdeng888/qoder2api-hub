@@ -97,10 +97,13 @@ echo
 echo "  Python   : $PYEXE"
 echo
 echo "  Keep this terminal open. Ctrl+C stops the server."
+echo "  Or stop it from another shell:  ./stop-qoder-proxy.sh"
 echo "==========================================================="
 echo
 
 # exec (not a child process) so the server's lifetime is exactly this
 # terminal's: Ctrl+C or closing the terminal stops it, and killing the
 # launcher can never leave an orphan holding the port.
-exec "$PYEXE" "$SCRIPT" --port "$PORT"
+# issue #89: write the pid file here too, so stop-qoder-proxy.sh can find us
+PIDFILE="$HERE/qoder-proxy.pid"
+exec "$PYEXE" "$SCRIPT" --port "$PORT" --pid-file "$PIDFILE"

@@ -86,6 +86,45 @@ python qoder_proxy.py [--host HOST] [--port PORT] [--lan] [--api-key KEY]
 
 ## 环境变量
 
+### 前缀会话亲和（可选：内存 / Redis）
+
+相同出站消息前缀优先复用已有的 Qoder 上游 `session_id`。默认关闭。
+单进程可直接设置 `QD_SESSION_CACHE=memory`，不需要 Redis 或第三方 Python 包。
+多进程共享或网关重启后需要复用映射时，可选 Redis 后端。
+
+这里保存的是 **前缀摘要 → 上游 session UUID** 的路由索引，不是模型 KV Cache，
+也不保存对话正文、上游访问 token 或 API Key 明文。实际推理缓存由 Qoder 上游控制；
+稳定 session 不保证每次缓存命中，前缀变化、上游淘汰和路由变化仍会影响命中率。
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `QD_SESSION_CACHE` | `off`（配置 Redis URL 时为 `redis`） | `off` / `memory` / `redis`；显式 `off` 优先 |
+| `QD_SESSION_CACHE_TTL` | `3600` | 映射空闲有效期，秒，范围 60–86400；命中后续期 |
+| `QD_SESSION_CACHE_MAX_ENTRIES` | `4096` | 内存后端最多保留的前缀映射条数（不是会话数），范围 1–100000，LRU 淘汰 |
+| `QD_SESSION_REDIS_URL` | 空 | `redis://[:password@]host:6379/0` 或 `rediss://...`；通过环境注入凭证 |
+| `QD_SESSION_REDIS_TIMEOUT` | `0.4` | Redis 每次连接/读写的超时，秒 |
+| `QD_SESSION_REDIS_TTL` | `3600` | Redis 初版配置别名；`QD_SESSION_CACHE_TTL` 优先 |
+
+按实际出站消息计算累计 HMAC，原子选择最长匹配前缀（内存锁 / Redis Lua）。前缀至少
+包含第一条非空 user 消息，不会仅凭共同 system 合并会话。映射按 API Key 标识、上游
+账号、区域、模型、工具和参数隔离；客户端提供 `X-Conversation-Id` 等会话 ID 时也隔离
+不同会话。未提供 ID 时，同一 API Key 下完全相同的初始对话前缀可共享 session；
+需要独立对话时应显式传会话 ID。账号故障切换后重新查找该账号自己的映射。
+
+内存后端重启清空，过期/淘汰后重新生成 UUID；最多保留指定条数。
+Redis 后端仅保存 HMAC 键与随机 UUID 值（共享部署需使用相同面板会话签名密钥），
+可配持久化；只支持单机或代理入口，不跟随 Cluster 的 MOVED/ASK 重定向。
+Redis 不可达、配置错误或缓存值非法时，回退到新的随机 session，可能冷启动但不阻断推理。
+日志不打印连接地址或异常详情。普通推理用量记录包含 `session_affinity`（`memory-prefix` /
+`redis-prefix` / `random`）和 `upstream_session_id`，用于区分路由复用与实际 token 命中。
+
+可选 Redis Compose 源码构建方案：
+
+    docker compose -f docker-compose.yml -f docker-compose.redis.yml up -d --build
+
+Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
+设置 `QD_SESSION_CACHE=off` 并重启网关即可恢复随机 session 行为。
+
 ### 基础
 
 | 变量 | 默认值 | 说明 |
