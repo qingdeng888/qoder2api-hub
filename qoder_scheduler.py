@@ -429,8 +429,10 @@ class Scheduler(object):
 
         # 2. 每日签到：整点签到窗口内执行；其余巡检只补签未签账号
         #    （能力运行时探测：接口不存在的区域由 run_checkin 给出原因并跳过）
+        # issue #102：禁用账号只要开了「暂停期间仍签到」也进签到 targets；
+        # stale_uids（凭证失效）始终排除——签了必然失败还会覆盖余额快照。
         targets = [a for a in self.pool.accounts
-                   if a.enabled and a.access_token and a.uid not in stale_uids]
+                   if a.checkin_eligible() and a.uid not in stale_uids]
         if checkin_due:
             pending = targets          # 09:00 / 21:00 窗口不受启动闸门影响
         elif allow_complement:

@@ -89,7 +89,7 @@ Claude Code、Codex CLI、OpenCode、DSH、Crush 可以在看板「智能体配�
 | **账号级出口绑定** | 每个 Qoder 账号可选 `默认 / auto / bind / rotate / direct`，覆盖推理、模型清单、刷新、额度与签到（`_openapi_json` 已透传账号）；随账号 JSON 持久化 | 设置 → 账号代理绑定 |
 | **API 连通性测试** | 用本地 API Key 向本网关发一次真实请求，验证 Key → 路由/账号/代理 → 上游 → 响应全链路，展示状态/耗时/出口/回复与原始响应 | 网关 → API 连通性测试 |
 | **可自定义检测模型** | 连通性测试、账号「测试」与 **403 冷却判定**统一使用它；免费模型会变，所以可改（留空 = `Qwen3.8-Flash`） | 设置 → 检测模型（`probe_model`） |
-| **403 自动禁用策略** | 只有**检测模型**的 403 才冷却/自动禁用账号（**2 小时**后自动恢复）；付费模型的 403、付费墙（112）、排队（10605）、内容审核、参数错一律不动账号 | 自动生效，`QD_403_DISABLE_SECS` 可调 |
+| **403 冷却/禁用策略** | 只有**检测模型**的 403 才冷却/自动禁用账号（**2 小时**后自动恢复）；付费模型 403 只换号。额度类 403（112/110）的长冷却同样只在「检测模型 + 免费模型」上生效 | 自动生效，`QD_403_DISABLE_SECS` 可调 |
 | **账号备注** | 账号池每个号可写备注（`note`，120 字），导入导出往返保留；`/accounts/note` 为主接口，`/accounts/remark` 保留为别名 | 账号行「备注」 |
 | **本地 web 工具**（上游 v1.6.4） | 客户端声明的 `web_search` / `web_fetch` 由网关本地执行（含 SSRF 防护、轮次上限）；默认关闭 | 设置 → 本地 web 工具 |
 | **自动构建镜像** | 每次 push `main` 构建并推送 `ghcr.io/qingdeng888/qoder2api-hub:latest`（`sha-<短提交>`；打 `v*` tag 追加语义化版本） | `.github/workflows/docker-publish.yml` |
@@ -100,7 +100,7 @@ Claude Code、Codex CLI、OpenCode、DSH、Crush 可以在看板「智能体配�
 ```bash
 docker compose pull && docker compose up -d
 # 或指定版本
-docker pull ghcr.io/qingdeng888/qoder2api-hub:1.7.6
+docker pull ghcr.io/qingdeng888/qoder2api-hub:1.7.10
 ```
 
 API Key / 面板密码不要写进仓库：用 shell 环境变量或同目录 `.env` 传入，例如

@@ -1540,6 +1540,9 @@ class Account(object):
             self.last_credits_delta_at = float(data.get("lastCreditsDeltaAt") or 0)
         except (TypeError, ValueError):
             self.last_credits_delta_at = 0.0
+        # issue #102：禁用只表示「不接推理流量」，不等于「不签到」。
+        # 默认关闭 = 维持历史行为（禁用即全停）。
+        self.checkin_when_disabled = bool(data.get("checkinWhenDisabled"))
         self._credit_usage_cache = None   # (ts, payload) 官方积分消耗
         self._achievements_cache = None   # (ts, payload) 已获成就
         # 已领取活动的兑换码（如「奶茶免单卡」REDEMPTION_CODE）：活动只发一次，
@@ -1604,6 +1607,7 @@ class Account(object):
             "lastCheckin": self.last_checkin,
             "lastCreditsDelta": self.last_credits_delta,
             "lastCreditsDeltaAt": self.last_credits_delta_at,
+            "checkinWhenDisabled": bool(self.checkin_when_disabled),
             "campaignCodes": self.campaign_codes,
             "campaignBlockedUntil": self.campaign_blocked_until,
             "userType": self.user_type,
@@ -1611,6 +1615,22 @@ class Account(object):
             "organizationName": self.organization_name,
             "note": self.note,
         }
+
+    def inference_eligible(self):
+        """能否接推理流量：启用 + 有凭证（历史语义，未改）。"""
+        return bool(self.enabled and self.access_token)
+
+    def checkin_eligible(self):
+        """能否参与签到/领福利（issue #102）。
+
+        与推理口径解耦：只要凭证在，禁用账号也可以照常签到（账号级白拿的
+        每日奖励），前提是该账号显式打开了「暂停期间仍签到」。
+        凭证失效（无 access_token）一律不参与——signin 必然失败，还会用退化
+        响应覆盖余额快照。过期判定由调用方（调度器 stale_uids）负责。
+        """
+        if not self.access_token:
+            return False
+        return bool(self.enabled or self.checkin_when_disabled)
 
     def is_team(self):
         """是否团队 / 企业账号（issue #90）。
@@ -1712,6 +1732,7 @@ class Account(object):
             "lastCheckinDate": str(self.last_checkin or "")[:10],
             "lastCreditsDelta": self.last_credits_delta,
             "lastCreditsDeltaAt": self.last_credits_delta_at,
+            "checkinWhenDisabled": bool(self.checkin_when_disabled),
             "checkinCapability": ("unknown" if self.checkin_capability()[0] is None
                                   else ("available" if self.checkin_capability()[0]
                                         else "not_found")),

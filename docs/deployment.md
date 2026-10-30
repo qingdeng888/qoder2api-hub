@@ -87,7 +87,7 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 |---|---|
 | `latest` | 最新发布版 |
 | `1.7` | 1.7.x 系列的最新版 |
-| `1.7.6` | 固定版本 |
+| `1.7.10` | 固定版本 |
 | `sha-<短提交>` | 固定到某次构建 |
 
 **容器配置：**

@@ -63,7 +63,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.6"
+VERSION = "1.7.10"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -485,6 +485,13 @@ USAGE_LOG = os.path.join(USAGE_DIR, "usage.jsonl")
 USAGE_SUMMARY = os.path.join(USAGE_DIR, "usage-summary.json")
 DASHBOARD_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "dashboard.html")
+# Locale packs are plain JSON files dropped into i18n/: the folder listing *is* the
+# registry, so adding a language never touches code and never needs a restart.
+I18N_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "i18n")
+# The route is unauthenticated (the login gate itself needs translating), so the
+# requested name is matched against this allowlist before it ever reaches the
+# filesystem. Anchored at both ends and .json-only: no separator, no "..", no NUL.
+I18N_FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,31}\.json$")
 USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "reasoning_tokens",
                 "cached_tokens", "total_tokens", "credit",
                 # issue #22：折扣时段对账要用的原价积分（数值，参与聚合）。
@@ -540,6 +547,9 @@ def _empty_stats():
 
 
 _usage = _empty_stats()
+
+
+_BILLED_WARN_AT = {}
 
 
 def _extract_usage(usage):
@@ -611,6 +621,21 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
     fields = _extract_usage(usage)
     if not fields:
         return None
+    # issue #105：上游可能**静默换模型计费**（实测把 kmodel_latest 记成 auto）。
+    # 只有换号时才多写一个键——旧行格式零变化，面板/统计按需显示。
+    _billed = str((usage or {}).get("model") or "")
+    if _billed and _billed != str(model or ""):
+        fields["billed_model"] = _billed
+        # 上游对网关身份常常统一回报 "auto"（issue #113 实测：dfmodel 也一样），
+        # 逐请求 WARN 会把日志刷满——同一 (请求, 回报) 组合每小时只提醒一次。
+        _bk = (str(model or ""), _billed)
+        _now = time.time()
+        if _now - _BILLED_WARN_AT.get(_bk, 0) > 3600:
+            _BILLED_WARN_AT[_bk] = _now
+            log("upstream reports a different model name: requested=%s billed=%s"
+                " (billing/quota attribution follows the upstream name;"
+                " check /diag/model-billing)" % (model, _billed),
+                level="WARN", tag="chat")
     row = {
         "at": time.time(),
         "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -2447,6 +2472,8 @@ def runtime_settings_view():
         },
         # 本地 web 工具开关（默认关）：这是唯一由模型驱动出网的能力
         "web_tools": web_tools_enabled(),
+        # issue #106：各模型上下文档（面板回显 + 客户端可查）
+        "model_context": _model_context_snapshot(),
         "web_tools_rounds": WEB_TOOLS_MAX_ROUNDS,
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
@@ -3226,6 +3253,41 @@ def strip_data_prefix(line):
     return line
 
 
+def normalize_usage_for_client(usage):
+    """把上游的多套缓存字段归一写进 OpenAI 标准位（issue #112）。
+
+    上游按模型族换字段：DeepSeek 用 `prompt_cache_hit_tokens`、Qwen 用
+    `completion_tokens_details.cached_tokens`，都不发标准位
+    `prompt_tokens_details.cached_tokens` —— 按标准协议解析的客户端恒读 0。
+    这里复用 _extract_usage 的优先级把数字搬过去，**原字段保留**（不删上游惯例，
+    避免已经适配了上游形态的客户端反而读不到）。
+    """
+    if not isinstance(usage, dict):
+        return usage
+    det = usage.get("completion_tokens_details") or {}
+    pdet = usage.get("prompt_tokens_details")
+    pdet = dict(pdet) if isinstance(pdet, dict) else {}
+    val = None
+    for cand in (usage.get("prompt_cache_hit_tokens"),
+                 det.get("cached_tokens") if isinstance(det, dict) else None,
+                 pdet.get("cached_tokens")):
+        try:
+            n = int(cand or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n > 0:
+            val = n
+            break
+    if val is None:
+        if "prompt_tokens_details" in usage and pdet:
+            return usage          # 上游已经给了标准位，别动它
+        return usage
+    if pdet.get("cached_tokens") == val and usage.get("prompt_tokens_details"):
+        return usage
+    pdet["cached_tokens"] = val
+    usage["prompt_tokens_details"] = pdet
+    return usage
+
 def clean_chunk(raw):
     """Drop the empty noise fields the gateway pads deltas with."""
     try:
@@ -3235,6 +3297,12 @@ def clean_chunk(raw):
     if not isinstance(obj, dict):
         return raw
     changed = False
+    # issue #112：流尾 usage 帧也要按 OpenAI 标准位给 cached_tokens
+    if isinstance(obj.get("usage"), dict):
+        before = json.dumps(obj["usage"], sort_keys=True)
+        obj["usage"] = normalize_usage_for_client(obj["usage"])
+        if json.dumps(obj["usage"], sort_keys=True) != before:
+            changed = True
     for choice in obj.get("choices") or []:
         delta = choice.get("delta")
         if not isinstance(delta, dict):
@@ -5621,6 +5689,13 @@ def build_qoder_body(payload, account, model_key, realm=None):
     mc["url"] = ""
     mc["source"] = "system"
     mc["max_input_tokens"] = catalog_meta.get("max_input_tokens") or 180000
+    # issue #106：官方清单默认 ~200K，但模型实际支持 1M 档——允许按请求/设置抬窗。
+    try:
+        _ctx = model_context_override(payload, model_key, model, r)
+        if _ctx:
+            mc["max_input_tokens"] = _ctx
+    except Exception as _exc:
+        log("context override failed: %s" % _exc, level="WARN", tag="chat")
     body["model_config"] = mc
 
     # chat_context 高亮与模型配置副本
@@ -6134,6 +6209,19 @@ def is_free_model(model):
     return key in FREE_MODEL_IDS
 
 
+def _quota_cooldown_applies(model):
+    """额度类 403（112 额度耗尽 / 110 每日次数上限）是否该冷却账号。
+
+    本 fork 的账号惩罚口径：**只有检测模型上的 403 才算账号问题**。额度类再收窄
+    一层——要求这个检测模型确实是免费模型：
+      - 付费模型被请求 -> 112 只是「这个号没充值」，冷却会把整池零积分号停掉；
+      - 把收费模型误设成检测模型 -> 112 同样是「没充值」，冷却属于配置事故
+        （v1.5.5 现场曾因此一次性禁用 3 个号）。
+    因此返回 True 当且仅当 model 既是检测模型、又是内置免费模型。
+    """
+    return is_probe_model(model) and is_free_model(model)
+
+
 def should_auto_disable_403(detail, model=None):
     """403 是否应触发「自动禁用 2 小时」。返回 (bool, reason)。
 
@@ -6315,6 +6403,10 @@ def friendly_upstream_error(code, detail):
         return ("上游模型排队中（10605 / RESOURCE_LIMIT）：请稍后重试，"
                 "或换一个模型/区域。这不是你的 Key、账号或网络问题。"
                 "上游详情：%s" % (detail[:160] or "(无详情)"), "upstream_queued")
+    # issue #108：额度耗尽也走 403，但重试无效——让客户端看懂该充值/换号
+    if _quota_cooldown(detail)[0] == "exhausted":
+        return ("上游账号额度耗尽（112 / pricingUrl）：重试无效，请充值或启用其它账号。"
+                "上游详情：%s" % (detail[:160] or "(无详情)"), "quota_exhausted")
     # issue #64：版本过低是硬门控（官方客户端会自己升级，网关只能提示）
     if "430" in str(code):
         return ("客户端/网关版本过低（430）：上游要求升级后才能继续。"
@@ -6365,6 +6457,58 @@ def _to_int_status(status):
         return 502
 
 
+# issue #108：上游对「额度耗尽」/「每日计费上限」也回 403，与「凭证被拒」同码不同因：
+# 重试和 60s 冷却都不会变好，账号还会被反复挑中（每次白等 60-105s）。
+_QUOTA_112_COOLDOWN = 1800
+
+
+def _quota_cooldown(detail):
+    """额度类 403 的 (病因, 冷却秒数)；不是额度问题返回 ('', 0)。
+
+    112 额度耗尽 -> 30 分钟；110 每日次数上限 -> 到本地 0 点（封顶 6h，免得时区乱跳）。
+    detail 可能被套在字符串里（转义形态 \\"code\\":\\"112\\"），先去掉反斜杠再匹配。
+    """
+    s = str(detail or "").replace("\\", "")
+    if "pricingUrl" in s or re.search(r'"code"\s*:\s*"?112\b', s):
+        return "exhausted", _QUOTA_112_COOLDOWN
+    if "Billing daily count exceeded" in s or re.search(r'"code"\s*:\s*"?110\b', s):
+        now = time.time()
+        midnight = time.mktime(time.localtime(now)[:3] + (0, 0, 0, 0, 0, -1)) + 86400
+        # +1：向上取整到整秒，免得日志把 0 点显示成 23:59
+        return "daily", int(max(60, min(6 * 3600, midnight - now))) + 1
+    return "", 0
+
+
+def _note_quota_cooldown(account, status, detail, where, model=None):
+    """额度类 403：按病因冷却账号并打日志；返回 True 表示已处理（调用方应轮换）。
+
+    issue #108：配额不是凭证失效，所以不改 enabled、也不喂降权。冷却**刻意不传**
+    single_account——note_error 会把它压成 3s，单号池里 bug 会原样保留。
+    """
+    kind, cd = _quota_cooldown(detail)
+    if not kind or not account or not hasattr(account, "note_error"):
+        return False
+    # 本 fork 口径：只有「检测模型且是免费模型」上的额度 403 才冷却账号。
+    # 付费模型 / 误配成检测模型的收费模型一律只换号，不动账号状态。
+    if not _quota_cooldown_applies(model):
+        log("account %s got quota %s on non-free model '%s' - not cooling "
+            "(paid models need credits; fix the probe model if this is wrong)"
+            % (account.uid[:8], kind, model or "?"), level="WARN", tag="chat")
+        return False
+    actual = float(account.note_error(
+        "%s HTTP %s quota %s: %s" % (where, status, kind, str(detail)[:80]),
+        cooldown=cd) or 0)
+    note_risk("rejected", detail)
+    if kind == "exhausted":
+        what = "quota exhausted (112) - cooling 30min"
+    else:
+        what = "daily count limit (110) - cooling until %s" % time.strftime(
+            "%m-%d %H:%M", time.localtime(time.time() + actual))
+    log("account %s %s (%.0fs), rotating" % (account.uid[:8], what, actual),
+        level="WARN", tag="chat")
+    return True
+
+
 def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None):
     """信封层非 200（如 403 队列满/Token被拒、429 等）冷却该账号并解绑会话，触发下次选号轮换。"""
     if isinstance(exc, InvalidToolArguments):
@@ -6409,6 +6553,10 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
             % (account.uid[:8], float(actual or 0), retry_secs, total),
             level="WARN", tag="chat")
     elif status_int in (401, 403):
+        # issue #108：额度类 403 要的是长冷却 + 换号，不是「凭证被拒」的 60s
+        if _note_quota_cooldown(account, status_int, detail, "envelope",
+                                model=model):
+            return
         dead = qoder_accounts.session_dead(detail)
         # 403 自动禁用（2h，到期自愈）：**只有免费模型上的 403 才算数**
         disable, why = should_auto_disable_403(detail, model=model)
@@ -6615,6 +6763,64 @@ def max_output_limit(model, realm=None):
             return v
     return None
 
+
+def _context_token_count(label, meta):
+    """把 1M/400K/200K 这类档位名解析成 token 数（对照官方 context_config）。"""
+    s = str(label or "").strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return int(s)
+    cfg = (meta or {}).get("context_config") or {}
+    for k, v in cfg.items():
+        if str(k).strip().lower() == s.lower() and isinstance(v, dict):
+            try:
+                return int(v.get("token_count") or 0) or None
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def model_context_override(payload, model_key, model, realm):
+    """本请求实际生效的上下文覆盖（token 数），没有则 None。
+
+    优先级：请求头 X-QD-Context（入口写进 payload["_qd_context"]）
+            > 面板设置 model_context（按上游 key 与客户端模型名两查）。
+    超出官方 context_config 的档位会被忽略并打 WARN——上游不认的窗口发过去只会 400。
+    """
+    raw = (payload or {}).get("_qd_context")
+    source = "header"
+    if raw in (None, ""):
+        try:
+            table = qoder_settings.model_context(ACCOUNTS_DIR)
+        except Exception:
+            table = {}
+        raw = table.get(model_key) if model_key else None
+        if raw in (None, "") and model:
+            raw = table.get(model)
+        source = "settings"
+    if raw in (None, ""):
+        return None
+    meta = {}
+    try:
+        for m in qoder_catalog.models_for_realm(realm or CURRENT_REALM):
+            if m.get("key") == (model_key or model):
+                meta = m
+                break
+    except Exception:
+        meta = {}
+    tokens = _context_token_count(raw, meta)
+    if tokens is None:
+        log("context override %r (%s) not in official context_config for %s - ignored"
+            % (raw, source, model_key or model), level="WARN", tag="chat")
+    return tokens
+
+
+def _model_context_snapshot():
+    try:
+        return dict(qoder_settings.model_context(ACCOUNTS_DIR))
+    except Exception:
+        return {}
 
 def clamp_max_tokens(value, model, realm=None):
     """把请求里的 max_tokens 压到已知上限以内（返回 (value, clamped?)）。"""
@@ -7399,6 +7605,15 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                         level="WARN", tag="chat")
                     last_error = exc
                     continue
+                # issue #108：额度类 403（112 额度耗尽 / 110 每日次数上限）长冷却换号，
+                # 不吃 single_account 的 3s clamp。冷却只对「检测模型且免费」生效
+                # （见 _quota_cooldown_applies）；配额耗尽不是账号被封，不禁用。
+                if _note_quota_cooldown(account, exc.code, detail, "HTTP",
+                                        model=model):
+                    if session_key and POOL:
+                        POOL.affinity.unbind(session_key)
+                    last_error = exc
+                    continue
                 if exc.code == 403 and why == "probe_model_needs_payment":
                     log("account %s hit a payment wall on probe model '%s' - "
                         "not cooling (fix the probe model in settings)"
@@ -7891,7 +8106,7 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
         "choices": [{"index": 0, "message": message, "finish_reason": finish}],
     }
     if usage:
-        out["usage"] = usage
+        out["usage"] = normalize_usage_for_client(usage)   # issue #112
     out["elapsed_ms"] = int((time.time() - started) * 1000)
     out["first_chunk_at"] = first_chunk_at
     return out
@@ -9422,6 +9637,22 @@ class Handler(BaseHTTPRequestHandler):
                 or self._banned_model_error(model)
                 or self._key_model_error(model))
 
+    def _apply_context_header(self, target):
+        """把 X-QD-Context 请求头写进将传给 build_qoder_body 的 payload（#106）。
+
+        先无条件清掉 body 里的同名键：客户端不能靠伪造 _qd_context 提窗；
+        只有 HTTP 头能设置。值可为 1M/400K/200K（对照官方 context_config）
+        或正整数 token 数，非法值在 model_context_override 里统一忽略并告警。
+        """
+        try:
+            if isinstance(target, dict):
+                target.pop("_qd_context", None)
+                hdr = str(self.headers.get("X-QD-Context") or "").strip()[:12]
+                if hdr:
+                    target["_qd_context"] = hdr
+        except Exception:
+            pass
+
     def _request_realm(self, explicit=None):
         """Pick the upstream exit for this request.
 
@@ -9526,6 +9757,10 @@ class Handler(BaseHTTPRequestHandler):
                                "invalid_request_error")
         if path in ("/", "/dashboard", "/ui"):
             return self._dashboard()
+        if path == "/i18n/manifest":
+            return self._i18n_manifest()
+        if path.startswith("/i18n/"):
+            return self._i18n_pack(path[len("/i18n/"):])
         if path == "/panel/status":
             # 不带 token 也要回答：看板需要先知道是否显示登录页。
             info = {
@@ -10124,6 +10359,108 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # ---- locale packs ----------------------------------------------------
+    # i18n/<code>.json is the whole registry: the folder listing decides which
+    # languages the panel offers, so a new locale is a file drop, not a code
+    # change. Files are re-read per request (like _dashboard) so a dropped or
+    # edited pack takes effect without restarting the gateway.
+
+    @staticmethod
+    def _i18n_tiers_ok(data):
+        """True when every tier is an object of string -> string.
+
+        The frontend's load() applies the same rule, but validating only there
+        would let a broken pack show up in the language dropdown and then do
+        nothing when picked — a silent no-op is the worst failure shape for a
+        feature whose whole promise is "missing key falls back quietly".
+        Rejecting here makes a malformed pack invisible, which is consistent.
+        """
+        for tier in ("messages", "patterns", "fragments"):
+            value = data.get(tier)
+            if value is None:
+                continue
+            if not isinstance(value, dict):
+                return False
+            for key, item in value.items():
+                if not isinstance(item, str):
+                    return False
+        return True
+
+    @staticmethod
+    def _i18n_read(name):
+        """Return (abs_path, body_bytes, parsed_dict) for a locale pack.
+
+        Raises ValueError for anything that is not a safe, well-formed pack:
+        the name is checked against the allowlist *before* the filesystem is
+        touched, and the resolved path must still live inside I18N_DIR so a
+        symlink planted in the folder cannot expose accounts/ or usage data.
+        """
+        if not name or not I18N_FILE_RE.match(name):
+            raise ValueError("invalid locale name")
+        abs_path = os.path.realpath(os.path.join(I18N_DIR, name))
+        root = os.path.realpath(I18N_DIR)
+        if os.path.dirname(abs_path) != root:
+            raise ValueError("locale path escapes the i18n folder")
+        try:
+            with open(abs_path, "rb") as fh:
+                body = fh.read()
+        except Exception:
+            raise ValueError("locale pack unreadable")
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except Exception:
+            raise ValueError("locale pack is not valid JSON")
+        if not isinstance(data, dict):
+            raise ValueError("locale pack must be a JSON object")
+        if not Handler._i18n_tiers_ok(data):
+            raise ValueError("locale tiers must be string->string objects")
+        return abs_path, body, data
+
+    def _i18n_manifest(self):
+        packs = []
+        try:
+            names = sorted(os.listdir(I18N_DIR))
+        except Exception:
+            names = []       # no i18n/ folder yet is a normal state, not an error
+        for name in names:
+            if not I18N_FILE_RE.match(name):
+                continue
+            try:
+                _, _, data = self._i18n_read(name)
+            except ValueError as exc:
+                log("i18n: skipping %s (%s)" % (name, exc))
+                continue
+            meta = data.get("@locale")
+            meta = dict(meta) if isinstance(meta, dict) else {}
+            # The filename is the authority on the code: a pack that claims to
+            # be "en" while filed as de.json would otherwise be fetched by a
+            # name that does not match what the panel then loads.
+            meta["code"] = name[:-len(".json")]
+            meta.setdefault("name", meta["code"])
+            meta.setdefault("order", 100)
+            meta.setdefault("dir", "ltr")
+            try:
+                meta["order"] = int(meta["order"])
+            except Exception:
+                meta["order"] = 100
+            packs.append(meta)
+        packs.sort(key=lambda p: (p.get("order", 100), p.get("code", "")))
+        return self._json(200, {"default": "zh", "packs": packs})
+
+    def _i18n_pack(self, name):
+        try:
+            _, body, _ = self._i18n_read(name)
+        except ValueError:
+            # 404, never the exception text: this body is rendered into a toast.
+            return self._error(404, "no such locale pack",
+                               "invalid_request_error")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _read_payload(self, max_bytes=MAX_PAYLOAD_BYTES, allow_list=False):
         """Parse the request body into a dict (or a list when allow_list)."""
         try:
@@ -10451,6 +10788,60 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "token": token})
         return self._unknown_path_error(path)
 
+    def _handle_diag_billing(self, payload):
+        """issue #113：发最小请求，回报上游实际按哪个模型计费。"""
+        # issue #113：上游可能「静默按另一个模型计费」（kmodel_latest -> auto）。
+        # 这里发一个最小请求，把**上游实际回报的模型名**取回来，便于用户自证。
+        model = str((payload or {}).get("model") or "").strip()
+        if not model:
+            return self._error(400, "model required")
+        realm = (payload or {}).get("realm") or self._request_realm()
+        probe_payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "stream": True,
+            "max_tokens": 16,
+        }
+        billed, usage, chunks = set(), None, 0
+        t0 = time.time()
+        try:
+            resp, acc, _ = open_upstream(probe_payload, target_realm=realm)
+            for line in iter_inner_sse(resp, holder=None):
+                chunks += 1
+                text = line.decode("utf-8", "replace")
+                for m in re.findall(r'"model"\s*:\s*"([^"]+)"', text):
+                    if "chat.completion" not in m:
+                        billed.add(m)
+                if '"usage"' in text and chunks > 1:
+                    usage = text
+                if chunks > 400:
+                    break
+            resp.close()
+        except UpstreamStatus as exc:
+            return self._json(200, {"ok": False, "model": model,
+                                    "error": "upstream status %s" % exc.status,
+                                    "detail": str(exc.detail)[:300],
+                                    "elapsed_ms": int((time.time() - t0) * 1000)})
+        except Exception as exc:
+            return self._json(200, {"ok": False, "model": model,
+                                    "error": str(exc)[:300],
+                                    "elapsed_ms": int((time.time() - t0) * 1000)})
+        got = sorted(billed)
+        mismatch = bool(got) and model not in got
+        if mismatch:
+            log("diag model-billing: requested=%s billed=%s (upstream re-routed)"
+                % (model, ",".join(got)), level="WARN", tag="diag")
+        return self._json(200, {
+            "ok": True,
+            "model": model,
+            "realm": realm,
+            "billed": got,
+            "billed_mismatch": mismatch,
+            "account": (acc.uid[:8] if acc else None),
+            "chunks": chunks,
+            "elapsed_ms": int((time.time() - t0) * 1000),
+        })
+
     def _handle_accounts(self, path, payload):
         """Account-management endpoints (dashboard uses these)."""
         if POOL is None:
@@ -10539,8 +10930,9 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 # 不再按区域过滤：签到能力运行时探测，接口不存在的账号会在
                 # 日志里给出明确原因（历史问题：国际版点签到完全没反应）。
-                targets = [a for a in POOL.accounts
-                           if a.enabled and a.access_token]
+                # issue #102：签到与「是否接推理」解耦——禁用但开了
+                # checkinWhenDisabled 的账号仍参与（凭证缺失的仍排除）
+                targets = [a for a in POOL.accounts if a.checkin_eligible()]
             if not targets:
                 return self._json(200, {"ok": False, "msg": "未找到可用账号（账号已禁用或缺少凭证）"})
             res = qoder_tasks.run_batch_checkin(targets, gap=1.0)
@@ -10564,8 +10956,9 @@ class Handler(BaseHTTPRequestHandler):
                                             "msg": "未找到指定的账号"})
                 targets = [target]
             else:
-                targets = [a for a in POOL.accounts
-                           if a.enabled and a.access_token]
+                # issue #102：签到与「是否接推理」解耦——禁用但开了
+                # checkinWhenDisabled 的账号仍参与（凭证缺失的仍排除）
+                targets = [a for a in POOL.accounts if a.checkin_eligible()]
             if not targets:
                 return self._json(200, {"ok": False, "msg": "未找到可用账号（账号已禁用或缺少凭证）"})
             res = qoder_tasks.run_batch_pro_claim(targets)
@@ -10613,6 +11006,18 @@ class Handler(BaseHTTPRequestHandler):
                 save_persisted_realm(new_realm)
             return self._json(200, {"ok": True, "current": CURRENT_REALM,
                                     "persisted": True})
+        if path == "/accounts/checkin-when-disabled":
+            # issue #102：禁用只表示不接推理流量；允许该账号在禁用期间照常签到
+            uid = payload.get("uid")
+            target = POOL.get(uid) if uid else None
+            if not target:
+                return self._json(200, {"ok": False, "msg": "未找到指定的账号"})
+            target.checkin_when_disabled = bool(payload.get("value"))
+            if target.path:
+                target.save(os.path.dirname(target.path))
+            return self._json(200, {"ok": True, "uid": target.uid,
+                                    "checkinWhenDisabled": target.checkin_when_disabled,
+                                    "accounts": account_views()})
         if path == "/accounts/checkin":
             # 账号面板的「每日签到」按钮：**只做每日签到领积分**——Credits 类活动
             # （如"每天领 100 Credits"，旧 sash 接口兜底），不领券/兑换码类活动，
@@ -10626,7 +11031,7 @@ class Handler(BaseHTTPRequestHandler):
             uid = payload.get("uid")
             targets = [POOL.get(uid)] if uid else list(POOL.accounts)
             targets = [a for a in targets
-                       if a is not None and a.enabled and a.access_token]
+                       if a is not None and a.checkin_eligible()]
             results = [None] * len(targets)
 
             def _one(idx, account):
@@ -10946,6 +11351,7 @@ class Handler(BaseHTTPRequestHandler):
         meta = catalog_meta_for(model_key, req_realm)
         chat_req = qoder_anthropic.messages_to_chat(
             payload, catalog_meta=meta, supported=supported_efforts(meta))
+        self._apply_context_header(chat_req)  # issue #106
         model = chat_req.get("model") or payload.get("model") or "auto"
         want_stream = bool(payload.get("stream"))
         session_key = extract_session_key(self.headers, chat_req)
@@ -11247,6 +11653,7 @@ class Handler(BaseHTTPRequestHandler):
         session_key = extract_session_key(self.headers, payload)
         custom_names = custom_tool_names(payload.get("tools"))
         chat_req = responses_to_chat(payload)
+        self._apply_context_header(chat_req)  # issue #106
         model = payload.get("model") or "auto"
         want_stream = bool(payload.get("stream"))
         t_start = time.time()
@@ -11609,6 +12016,30 @@ class Handler(BaseHTTPRequestHandler):
                 % (res.get("from"), res.get("to"), len(res.get("files") or []),
                    res.get("backup") or "-", restarted), tag="update")
             return self._json(200, dict(res, restarting=restarted))
+        if path == "/settings/model-context":
+            # issue #106：为某个模型设定上下文档（label="" 清除回到官方默认）
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            try:
+                body = self._read_payload()
+            except Exception as exc:
+                return self._error(400, "invalid json: %s" % exc,
+                                   "invalid_request_error")
+            model = str((body or {}).get("model") or "").strip()
+            label = (body or {}).get("label")
+            if not model:
+                return self._error(400, "model required", "invalid_request_error")
+            label = str(label).strip() if label not in (None, "") else ""
+            if label.isdigit():
+                label = int(label)
+            try:
+                table = qoder_settings.set_model_context(ACCOUNTS_DIR, model, label)
+            except Exception as exc:
+                return self._error(500, "save failed: %s" % exc)
+            log("model context set: %s -> %s" % (model, label or "(default)"),
+                tag="panel")
+            return self._json(200, {"ok": True, "model_context": table})
         if path == "/settings/web-tools":
             # 本地 web 工具开关（面板 UI）：默认关，开/关都立即生效
             if not self._panel_ok():
@@ -11693,7 +12124,9 @@ class Handler(BaseHTTPRequestHandler):
                 "/v1/responses", "/responses",
                 # Anthropic Messages（task-78 接线）：两条都要进白名单，
                 # 否则会在 404 分支被拦掉（CORS 无需另加，"/v1" 前缀已覆盖）。
-                "/v1/messages", "/v1/messages/count_tokens"):
+                "/v1/messages", "/v1/messages/count_tokens",
+                # issue #113：模型计费自检（面板鉴权，见下方分支）
+                "/diag/model-billing"):
             if path in ("/v1/completions", "/completions"):
                 # legacy Completions（prompt 而非 messages）本网关不实现：
                 # 明确 404 优于"接受请求却按空会话转发上游"。
@@ -11709,6 +12142,12 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._payload_or_error(allow_list=(path == "/accounts/import"))
         if payload is None:
             return
+        if path == "/diag/model-billing":
+            # issue #113：模型计费自检（面板鉴权）
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            return self._handle_diag_billing(payload)
         if is_account_route:
             return self._handle_accounts(path, payload)
         # 本地 web 工具：客户端声明了内置 web_search / web_fetch 时由网关代跑
@@ -11735,6 +12174,7 @@ class Handler(BaseHTTPRequestHandler):
         fp = prompt_fingerprint(payload.get("messages"))
         t_start = time.time()
         effort = requested_effort(payload)   # 与 usage 记账、请求体构造同源
+        self._apply_context_header(payload)  # issue #106：X-QD-Context 抬窗
         log("chat: model=%s client_effort=%r stream=%s msgs=%d"
             % (model, effort, want_stream,
                len(payload.get("messages") or [])))

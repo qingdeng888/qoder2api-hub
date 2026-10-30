@@ -98,7 +98,11 @@ check("#70 保存时从圆环状态取时刻（不再手写文本）",
       "_schedFmt(SCHED.checkin)" in _dash
       and "_schedFmt(SCHED.keepalive)" in _dash)
 check("#70 不再依赖已删除的文本输入框", "schCheckin" not in _dash)
-_seg70 = _src.split('def _handle_accounts(self, path, payload):')[1][:6000]
+# 取整个 _handle_accounts 方法体（到下一个同缩进 def 为止），而不是固定 6000 字。
+# fork 在该方法里多挂了 /accounts/proxy-binding、/accounts/remark 等端点，
+# 固定窗口会把 /scheduler/config 截到窗口外，造成「明明在路由里却断言失败」。
+_seg70 = _src.split('def _handle_accounts(self, path, payload):')[1]
+_seg70 = _seg70.split('\n    def ', 1)[0]
 check("#70 /scheduler/config 在账号路由里处理（否则 404 unknown account endpoint）",
       'if path == "/scheduler/config":' in _seg70)
 check("#70 旧的无路由副本已删除（全文件只出现一次 set_schedule 调用点）",

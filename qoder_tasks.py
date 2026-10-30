@@ -661,8 +661,9 @@ def fetch_tasks_view(pool, realm=None, uid=None):
     if not pool or not pool.accounts:
         return {"tasks": [], "summary": {}, "accounts": [],
                 "msg": "未找到可用账号"}
+    # issue #102：签到/福利口径与推理解耦（禁用但开了开关的账号仍列出）
     eligible = [a for a in pool.accounts
-                if a.enabled and a.access_token
+                if a.checkin_eligible()
                 and (not realm or a.realm == realm)]
     if not eligible:
         return {"tasks": [], "summary": {}, "accounts": [],
