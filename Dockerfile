@@ -50,6 +50,10 @@ COPY qoder_proxy.py qoder_accounts.py qoder_catalog.py qoder_fingerprint.py \
 # 官方模型目录快照（运行时优先读取；缺失会回退 qoder_catalog.py 内嵌冻结副本）
 COPY qoder_catalog_intl.json qoder_catalog_cn.json ./
 
+# i18n 语言包（v1.7.10 起）：/i18n/manifest 靠扫描 <app>/i18n/*.json 生成清单，
+# 不 COPY 进镜像的话容器里面板永远只有中文（上游 Dockerfile 漏了这一行）。
+COPY i18n ./i18n
+
 # UMID 原生组件（构建期提取；运行时 qoder_accounts.runtime_info_exe() 在
 # POSIX 下按 <repo>/umid/runtime-info 查找）。builder 提取失败时这里是空目录。
 COPY --from=umid-builder /build/umid /app/umid
