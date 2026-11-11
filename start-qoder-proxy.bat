@@ -16,8 +16,21 @@ if "%PORT%"=="" set "PORT=8790"
 set "HERE=%~dp0"
 set "SCRIPT=%HERE%qoder_proxy.py"
 set "PIDFILE=%HERE%qoder-proxy.pid"
-set "LOGFILE=%HERE%qoder-proxy.log"
-set "ERRFILE=%HERE%qoder-proxy.err.log"
+if not defined QD_LOG_DIR set "QD_LOG_DIR=%HERE%logs"
+if not exist "%QD_LOG_DIR%" mkdir "%QD_LOG_DIR%"
+set "LOGFILE=%QD_LOG_DIR%\gateway.log"
+set "ERRFILE=%QD_LOG_DIR%\gateway.err.log"
+set "QD_LOG_REDIRECTED=1"
+
+rem issue #137 follow-up: enable structured tool history on INTL as well.
+rem Without it the gateway rewrites every tool call into assistant text
+rem ("[assistant ...]" + JSON) and long sessions make the model echo that,
+rem which the proxy then fails closed on (issue #72). Verified accepted by
+rem the upstream on 2026-11-05 (native tool_calls, empty content).
+rem The gateway's own default stays cn-only; an env var set by the caller wins.
+rem The gateway enables structured tool history on CN only by default.
+rem Uncomment the next line to enable it on INTL too (opt-in):
+rem if not defined QD_STRUCTURED_TOOL_HISTORY_REALMS set "QD_STRUCTURED_TOOL_HISTORY_REALMS=cn,intl"
 
 if not exist "%SCRIPT%" goto no_script
 

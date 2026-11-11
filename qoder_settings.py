@@ -200,6 +200,59 @@ def set_model_context(accounts_dir, model, label):
     save(accounts_dir, data)
     return cur
 
+def tool_echo_mode(accounts_dir):
+    """面板可切换的「工具协议残片收尾策略」（issue #135）；默认空=跟随环境/内置。"""
+    val = str(load(accounts_dir).get("tool_echo_mode") or "").strip().lower()
+    return val if val in ("strict", "lenient") else ""
+
+
+def set_tool_echo_mode(accounts_dir, mode):
+    """写入收尾策略；传空串表示清除（回落到环境变量/内置默认）。"""
+    data = load(accounts_dir)
+    val = str(mode or "").strip().lower()
+    if val in ("strict", "lenient"):
+        data["tool_echo_mode"] = val
+    else:
+        data.pop("tool_echo_mode", None)
+    save(accounts_dir, data)
+    return tool_echo_mode(accounts_dir)
+
+
+def anthropic_thinking(accounts_dir):
+    """面板/配置文件的全局 Anthropic thinking block 输出策略（issue #146）；默认空=跟随环境变量。"""
+    val = str(load(accounts_dir).get("anthropic_thinking") or "").strip().lower()
+    return val if val in ("empty", "off") else ""
+
+
+def set_anthropic_thinking(accounts_dir, mode):
+    """设置全局 Anthropic thinking 输出策略；传空串清除（回落到环境变量）。"""
+    data = load(accounts_dir)
+    val = str(mode or "").strip().lower()
+    if val in ("empty", "off"):
+        data["anthropic_thinking"] = val
+    else:
+        data.pop("anthropic_thinking", None)
+    save(accounts_dir, data)
+    return anthropic_thinking(accounts_dir)
+
+def _clean_account_selectors(value, allow_empty=False):
+    """Keep selectors deterministic; malformed restrictions must not fail open."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("account selectors must be lists")
+    out = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError("account selectors must contain strings")
+        item = item.strip()
+        if (item or allow_empty) and item not in out:
+            out.append(item)
+    return out
+
+
 def _clean_key_entry(entry):
     """Normalize one stored key entry; returns None when unusable."""
     if not isinstance(entry, dict):
@@ -220,8 +273,18 @@ def _clean_key_entry(entry):
         # P1-4：每 Key 模型白名单（空列表 = 不限制）。**必须显式保留**——
         # 本函数是白名单式重建，漏掉即「保存时被静默丢弃」（limits 同型坑）。
         "models": _clean_model_patterns(entry.get("models")),
+        # Empty selectors retain legacy unrestricted keys. A named group that
+        # no longer exists remains configured, so scope resolution denies all.
+        "account_ids": _clean_account_selectors(entry.get("account_ids")),
+        "account_groups": _clean_account_selectors(
+            entry.get("account_groups") if "account_groups" in entry
+            else ([entry["group"]] if "group" in entry else []), allow_empty=True),
         # issue #69：Key 备注（纯展示，不参与鉴权；同样必须显式保留）。
         "note": str(entry.get("note") or "").strip()[:120],
+        # issue #146：每 Key Anthropic thinking 策略（empty/off，空串跟随全局）。
+        "anthropic_thinking": (str(entry.get("anthropic_thinking") or "").strip().lower()
+                               if str(entry.get("anthropic_thinking") or "").strip().lower() in ("empty", "off")
+                               else ""),
     }
 
 

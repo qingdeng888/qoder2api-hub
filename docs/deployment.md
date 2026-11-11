@@ -86,16 +86,27 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 | Tag | 含义 |
 |---|---|
 | `latest` | 最新发布版 |
-| `1.7` | 1.7.x 系列的最新版 |
-| `1.7.10` | 固定版本 |
+| `1.9` | 1.9.x 系列的最新版 |
+| `1.9.6` | 固定版本 |
 | `sha-<短提交>` | 固定到某次构建 |
 
 **容器配置：**
 
 - 容器以 `--lan` 启动，会强制使用 API Key：要么通过 `API_KEY` 环境变量传入，要么在首次启动时自动生成，用 `docker compose logs qoder-proxy | grep -i "api key"` 查看
 - 环境变量：`HOST`（默认 `0.0.0.0`）、`PORT`（默认 `8790`）、`API_KEY`、`TZ`（默认 `Asia/Shanghai`）。改 `PORT` 时要同步修改 `ports:` 映射
-- 需要持久化的两个目录：`/app/accounts` 和 `/app/usage`。NAS 或长期部署建议挂载绝对路径
+- 需要持久化的目录：`/app/accounts`、`/app/logs`（v1.8.0 起流水写 `logs/usage`）、以及只作为迁移来源的 `/app/usage`。NAS 或长期部署建议挂载绝对路径
 - 镜像自带健康检查，探测的是 `/ping`
+
+### Claude Code 连续工具调用
+
+白名单模型（Qwen / GLM / DeepSeek）默认在 `cn` 和 `intl` 两个出口保留结构化工具历史，
+不再把 `assistant.tool_calls` 和 `role:tool` 改写为正文信封，减少模型复述工具协议后提前结束的问题。
+缺少工具 ID 的历史仍会回退；`QD_STRUCTURED_TOOL_HISTORY=off` 可关闭，
+`QD_STRUCTURED_TOOL_HISTORY_REALMS=cn` 可恢复仅国内区启用的范围。
+
+上游只返回截断工具数组、或正文里出现 `[Bash 工具调用]` 等伪调用时，网关会明确返回协议错误
+（Anthropic 流式为 `event: error`，非流式为 HTTP 502），不会伪装成成功的 `end_turn`。
+这类参数不完整的调用不会被猜测执行；代码围栏中的格式示例仍作为普通正文返回。
 
 ### 容器启动自检
 

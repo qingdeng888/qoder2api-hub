@@ -31,10 +31,14 @@ services:
       # 留空时 --lan 会首次自动生成并持久化到 accounts/settings.json。
       # 不要把真实 Key 写进本文件：用 shell 环境变量或同目录 .env 传入。
       - API_KEY=${API_KEY:-}
+      # 企业 VPC（仅 CN）：实例名或 acme.vpc.qoder.com.cn
+      # - QD_CN_VPC_ENDPOINT=acme
       - TZ=Asia/Shanghai
     volumes:
       # 持久化账号凭证、面板设置与请求流水
       - ./accounts:/app/accounts
+      - ./logs:/app/logs
+      # 旧流水目录只作为首次迁移来源，原文件保留；新数据写 logs/usage。
       - ./usage:/app/usage
     # --lan：监听全网卡并强制 API Key；--panel-password：Web 看板访问密码
     command:

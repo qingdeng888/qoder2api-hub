@@ -17,8 +17,14 @@ _use
 .team/
 accounts/
 usage/
+logs/
 .mimosa/
 _shots/
 umid/
+
+# 本地调试环境（含 PAT 的 .env 绝不进构建上下文）
 .env
 .env.local
+.venv/
+_tmp_*
+.tmp_*

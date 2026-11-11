@@ -21,7 +21,10 @@ function slice(from, to){
 
 const SORT = slice('// ---- 账号表排序（issue #111）', 'function renderAccounts(){');
 const THEAD_HEAD = 'box.innerHTML = ';
-const THEAD = slice(THEAD_HEAD + "'<div class=\"table-wrap\"><table><thead><tr>'", "+ '<div class=\"legend\">");
+// 结束锚点必须指向**账号表**的 legend：页面里还有其它 <div class=\"legend\">
+// （例如用量洞察的全价请求卡），用裸 legend 会切到错误位置或切出空串。
+const THEAD = slice(THEAD_HEAD + "'<div class=\"table-wrap\"><table><thead><tr>'",
+  "+ '<div class=\"legend\"><span>多个账号按会话粘性");
 check('锚点：排序函数区已抽到', SORT.length > 1200, SORT.length);
 check('锚点：表头区已抽到', THEAD.length > 300, THEAD.length);
 check('排序函数区不直接摸 DOM（除 renderAccounts 调用）',
@@ -59,7 +62,7 @@ check('昵称缺失时退回 UID 排序',
 
 api.sortAccounts('credits');
 const creditRows = [
-  A('r1', 'r1', { credits: { remain: 100, used: 0, size: 700 } }),
+  A('r1', 'r1', { credits: { remain: 100, used: 600, size: 700 } }),
   A('r2', 'r2', { credits: { remain: 684, used: 16, size: 700 } }),
   A('r3', 'r3', { creditsDegraded: { reason: 'envelopes HTTP 403 code 112' } }),
   A('r4', 'r4', { credits: { remain: 0, used: 200, size: 200 } }),
