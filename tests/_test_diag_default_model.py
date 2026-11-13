@@ -80,8 +80,13 @@ def main():
     for token in ("DIAG_DEFAULT_MODEL", "freeIds", "不消耗付费额度",
                   "诊断默认使用免费模型"):
         check("面板接线: %s" % token, token in html)
-    check("下拉静态首项就是 Qwen3.8-Flash（清单未加载时也正确）",
-          '<option value="Qwen3.8-Flash" selected>' in html)
+    # 连通性下拉与「模型」页签同源:静态 HTML 不写死任何模型,清单未加载时
+    # 只占位;提交兜底仍是免费默认模型(不会拿付费模型去测)。
+    check("下拉不写死模型,清单未加载时占位",
+          '<option value="Qwen3.8-Flash" selected>' not in html
+          and '正在从模型目录索引可用模型' in html)
+    check("清单未加载时提交兜底仍是免费默认模型",
+          "window.DIAG_DEFAULT_MODEL || 'Qwen3.8-Flash'" in html)
     check("默认不会被付费模型顶掉（钉在免费模型上）",
           "defaultId = pinned" in html)
     # /accounts/test 也必须默认免费模型，而不是 auto

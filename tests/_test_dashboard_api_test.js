@@ -48,15 +48,17 @@ const postJSON = async (url, body) => {
   };
 };
 const loadModels = async () => {};
+const getModelCatalogRealm = () => globalThis.__CATALOG_REALM__ || 'intl';
 
 let api = null;
 try {
   api = new Function('document', 'MODELS_DATA', 'esc', 'toast', 'postJSON',
-    'loadModels', block + `
+    'loadModels', 'getModelCatalogRealm', block + `
     return {
       renderApiTestModels, renderApiTestResult, runApiConnectivityTest,
       setModels: value => { MODELS_DATA = value; },
-    };`)(global.document, [], esc, toast, postJSON, loadModels);
+    };`)(global.document, [], esc, toast, postJSON, loadModels,
+    getModelCatalogRealm);
 } catch (err) {
   check('脚本块可执行', false, String(err));
 }
@@ -65,26 +67,52 @@ check('API 连通性函数可提取', api !== null);
 (async () => {
   if (api) {
     // 顺序故意让付费模型排在前面：默认必须是免费模型，不是「第一个」
+    // 模型目录(与「模型」页签同源):未开通(enabled:false)的模型不是
+    // 真实可用,不允许进入连通性测试下拉。
     api.setModels([
       {id: 'Paid-Ultimate', enabled: true, is_free: false},
       {id: 'Qwen3.8-Flash', enabled: true, is_free: true},
       {id: 'Qwen3.8-Max', enabled: false, is_free: true},
     ]);
     api.renderApiTestModels();
-    check('模型下拉包含全部模型',
+    check('下拉只索引开通模型(与模型页签同源)',
       els.apiTestModel.innerHTML.includes('Qwen3.8-Flash')
-      && els.apiTestModel.innerHTML.includes('Qwen3.8-Max'),
+      && els.apiTestModel.innerHTML.includes('Paid-Ultimate'),
       els.apiTestModel.innerHTML);
-    check('默认选中免费模型 Qwen3.8-Flash（不是第一个付费模型）',
+    check('未开通模型被排除在下拉之外',
+      !els.apiTestModel.innerHTML.includes('Qwen3.8-Max')
+      && !els.apiTestModel.innerHTML.includes('未开通'),
+      els.apiTestModel.innerHTML);
+    check('默认选中免费模型 Qwen3.8-Flash(不是第一个付费模型)',
       els.apiTestModel.value === 'Qwen3.8-Flash', els.apiTestModel.value);
     check('免费模型提示不消耗付费额度',
       els.apiTestModelHint.textContent.includes('免费模型'),
       els.apiTestModelHint.textContent);
-    check('未开通模型有标记',
-      els.apiTestModel.innerHTML.includes('未开通'),
-      els.apiTestModel.innerHTML);
-    check('模型数量状态显示', els.apiTestState.textContent.includes('3 个模型'),
+    check('状态显示目录区域与可用模型数',
+      els.apiTestState.textContent.includes('国际版')
+      && els.apiTestState.textContent.includes('2 个可用模型'),
       els.apiTestState.textContent);
+    // 目录区域切到国内版:下拉状态跟着标区域
+    globalThis.__CATALOG_REALM__ = 'cn';
+    api.renderApiTestModels();
+    check('目录区域切换后状态跟随',
+      els.apiTestState.textContent.includes('国内版'),
+      els.apiTestState.textContent);
+    globalThis.__CATALOG_REALM__ = 'intl';
+    // 目录为空:占位并提示重新索引,不写死任何模型
+    api.setModels([]);
+    api.renderApiTestModels();
+    check('目录为空时占位并提示重新索引',
+      els.apiTestModel.innerHTML.includes('重新索引')
+      && els.apiTestModel.value === '',
+      els.apiTestModel.innerHTML);
+    // 恢复清单供后续提交用例
+    api.setModels([
+      {id: 'Paid-Ultimate', enabled: true, is_free: false},
+      {id: 'Qwen3.8-Flash', enabled: true, is_free: true},
+    ]);
+    api.renderApiTestModels();
+    els.apiTestModel.value = 'Qwen3.8-Flash';
 
     els.apiTestModel.value = 'Qwen3.8-Flash';
     els.apiTestMessage.value = '你是谁，出来干活了';
@@ -96,6 +124,8 @@ check('API 连通性函数可提取', api !== null);
       posted.body.model === 'Qwen3.8-Flash'
       && posted.body.message === '你是谁，出来干活了'
       && posted.body.max_tokens === 256, posted && posted.body);
+    check('测试出口跟随下拉索引的目录区域',
+      posted.body.realm === 'intl', posted && posted.body.realm);
     check('成功结果渲染回复',
       els.apiTestResult.innerHTML.includes('你好，我在'),
       els.apiTestResult.innerHTML.slice(0, 200));

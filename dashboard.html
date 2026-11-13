@@ -3716,10 +3716,11 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
       <div>
         <div style="font-size:12px;color:var(--dim);margin-bottom:4px">测试模型</div>
         <select id="apiTestModel" style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;color:var(--fg);font:inherit">
-          <!-- 首个选项就是固定默认：清单没加载完也已经是 Qwen3.8-Flash -->
-          <option value="Qwen3.8-Flash" selected>Qwen3.8-Flash · 免费（默认）</option>
+          <!-- 下拉与「模型」页签同源:renderApiTestModels 从模型目录(MODELS_DATA)实时
+               索引开通(enabled)的模型;清单未到达前先占位,不写死任何模型 -->
+          <option value="">正在从模型目录索引可用模型...</option>
         </select>
-        <div id="apiTestModelHint" style="font-size:11px;color:var(--dim);margin-top:4px"></div>
+        <div id="apiTestModelHint" style="font-size:11px;color:var(--dim);margin-top:4px">下拉与「模型」页签同源,只列开通的模型;切区域或点「刷新模型」即跟随模型目录更新。</div>
       </div>
       <div>
         <div style="font-size:12px;color:var(--dim);margin-bottom:4px">测试消息</div>
@@ -5716,38 +5717,45 @@ function renderAvailableModels(){
 function renderApiTestModels(){
   const sel = document.getElementById('apiTestModel');
   if(!sel) return;
-  const list = (MODELS_DATA || []).slice();
+  // 与「模型」页签同源:MODELS_DATA 就是 loadModels 拉回的模型目录。
+  // 「真实可用」= 目录里开通的模型:enabled === false(未开通)不进下拉——
+  // 拿它测试只会吃 112 付费墙,没有诊断价值。
+  const all = (MODELS_DATA || []).slice();
+  const list = all.filter(m => m && m.id && m.enabled !== false);
   const prev = sel.value;
   const hint = document.getElementById('apiTestModelHint');
   const state = document.getElementById('apiTestState');
+  const realmLabel = (getModelCatalogRealm() === 'cn') ? '国内版' : '国际版';
   if(!list.length){
-    sel.innerHTML = '<option value="">（暂无模型）</option>';
+    sel.innerHTML = '<option value="">(模型目录暂无开通模型,点「刷新模型」重新索引)</option>';
+    sel.value = '';            // 清掉旧选中值,提交时走后端免费默认而不是残留模型
     if(state) state.textContent = '';
+    if(hint) hint.textContent = '';
     return;
   }
-  // 诊断默认用免费模型：付费模型必然 112（付费墙），拿它做默认只会每次
-  // 都显示失败，掩盖真正的连通性问题。
-  const freeIds = list.filter(m => m.is_free && m.enabled !== false).map(m => m.id);
+  // 诊断默认使用免费模型:付费模型必然 112(付费墙),拿它做默认只会每次
+  // 都显示失败,掩盖真正的连通性问题。
+  const freeIds = list.filter(m => m.is_free).map(m => m.id);
   const pinned = (window.DIAG_DEFAULT_MODEL || 'Qwen3.8-Flash');
   const isPreferred = id => id === pinned || /qwen3\.8-flash/i.test(String(id));
-  sel.innerHTML = list.map(m => {
-    const suffix = m.enabled === false ? ' · 未开通' : (m.is_free ? ' · 免费' : '');
-    return '<option value="' + esc(m.id) + '">' + esc(m.id) + suffix + '</option>';
-  }).join('');
-  // 默认永远钉在免费模型上：pinned -> 同族免费 -> 任意免费 -> pinned（即使
-  // 清单里暂时没有也不改用付费模型，交给上游报错比静默换模型更好排查）。
+  sel.innerHTML = list.map(m =>
+    '<option value="' + esc(m.id) + '">' + esc(m.id) + (m.is_free ? ' · 免费' : '') + '</option>'
+  ).join('');
+  // 默认永远钉在免费模型上:pinned -> 同族免费 -> 任意免费 -> pinned(即使
+  // 清单里暂时没有也不改用付费模型,交给上游报错比静默换模型更好排查)。
   let defaultId = '';
   if(freeIds.indexOf(pinned) >= 0) defaultId = pinned;
   if(!defaultId) defaultId = (freeIds.find(isPreferred) || freeIds[0] || '');
   if(!defaultId) defaultId = pinned;
-  if(prev && prev === defaultId && list.some(m => m.id === prev)) sel.value = prev;
+  // 保留用户已选的模型(它仍在目录里时不被默认值顶掉)
+  if(prev && list.some(m => m.id === prev)) sel.value = prev;
   else sel.value = defaultId;
-  if(state) state.textContent = '(' + list.length + ' 个模型)';
+  if(state) state.textContent = '(' + realmLabel + ' · ' + list.length + ' 个可用模型)';
   if(hint){
     const chosen = list.find(m => m.id === sel.value);
-    if(!freeIds.length) hint.textContent = '当前没有可用的免费模型，诊断可能因付费墙失败';
-    else if(chosen && chosen.is_free) hint.textContent = '诊断默认使用免费模型，不消耗付费额度';
-    else hint.textContent = '';
+    if(!freeIds.length) hint.textContent = '当前目录没有免费模型,测试可能因付费墙失败';
+    else if(chosen && chosen.is_free) hint.textContent = '已按「模型」页签目录索引,默认免费模型,不消耗付费额度';
+    else hint.textContent = '已按「模型」页签目录索引(仅开通模型),测试走' + realmLabel + '出口';
   }
 }
 
@@ -5820,8 +5828,11 @@ async function runApiConnectivityTest(btn){
       + '正在向本网关发送真实请求…</div>';
   }
   try{
+    // 测试出口 = 下拉索引的目录区域(getModelCatalogRealm),保证
+    // 「从模型页签选到的模型」与实际路由同区,不会因默认出口不同而误报失败。
     const r = await postJSON('/diag/connectivity',
-      {model: model, message: message, max_tokens: 256});
+      {model: model, message: message, max_tokens: 256,
+       realm: getModelCatalogRealm()});
     if(box) box.innerHTML = renderApiTestResult(r);
     toast(r.ok ? ('API 连通性正常 (' + r.elapsed_ms + 'ms)')
                : ('测试失败: ' + (r.error || ('HTTP ' + r.status))),
@@ -9816,7 +9827,7 @@ function switchMainTab(tab){
   try{ if(tab === 'analytics') loadAnalytics(); }catch(e){ console.warn('analytics failed:', e); }
   try{ if(tab === 'analytics') loadInsights(); }catch(e){ console.warn('insights failed:', e); }
   try{ if(tab === 'agents') loadAgentsPage(false); }catch(e){ console.warn('agents failed:', e); }
-  try{ if(tab === 'models'){ loadModels(); loadSettings(); } if(tab === 'routing') adminLoadRouting(); if(tab === 'gateway') adminRenderOverview(); }catch(e){ console.warn('admin page failed:',e); }
+  try{ if(tab === 'models'){ loadModels(); loadSettings(); } if(tab === 'routing') adminLoadRouting(); if(tab === 'gateway'){ adminRenderOverview(); loadModels(); } }catch(e){ console.warn('admin page failed:',e); }
   try{ if(tab === 'settings') loadSettings(); }catch(e){ console.warn('settings failed:', e); }
   if(tab === 'logs'){
     startLogPolling();
