@@ -31,8 +31,10 @@ services:
       # 留空时 --lan 会首次自动生成并持久化到 accounts/settings.json。
       # 不要把真实 Key 写进本文件：用 shell 环境变量或同目录 .env 传入。
       - API_KEY=${API_KEY:-}
-      # 企业 VPC（仅 CN）：实例名或 acme.vpc.qoder.com.cn
-      # - QD_CN_VPC_ENDPOINT=acme
+      # 默认企业 VPC（仅 CN）：实例名或 TARGET.vpc.qoder.com.cn；可不设置。
+      # 账号入口可在看板独立选择：继承 / 指定实例 / 显式公网（空串覆盖默认）。
+      # 账号覆盖、凭证域推断优先于此默认；国际版仍使用公网。
+      # - QD_CN_VPC_ENDPOINT=TARGET
       - TZ=Asia/Shanghai
     volumes:
       # 持久化账号凭证、面板设置与请求流水

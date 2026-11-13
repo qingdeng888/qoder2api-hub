@@ -65,6 +65,7 @@ n_direct_p = src_p.count("urllib.request.urlopen(")
 # 代理池（v1.5.2+）后：chat / 模型清单 / 更新检查改走 _open_upstream()（池化
 # 选出口 + 传输层失败换代理）。剩余 2 处直连 = _open_upstream 的 env 分支
 # （池未启用时的旧行为）+ 启动时的本机端口自检（绝不能走代理）。
+# v1.9.7+：VPC 实例的模型发现走 _opener_for_request() 隔离 opener，不占直连基线。
 check("qoder_proxy.py 直连 urlopen 基线 == 2（env 分支 + 本机端口自检）",
       n_direct_p == 2, n_direct_p)
 check("qoder_proxy.py 上游请求走 _open_upstream（定义 + 3 个调用点）",

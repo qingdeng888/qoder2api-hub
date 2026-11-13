@@ -3627,9 +3627,9 @@ finally:
     else:
         os.environ["QD_STRUCTURED_TOOL_HISTORY"] = _orig_env32
 
-check("开关三态·auto：默认放行 CN/INTL+白名单（Qwen/GLM/DeepSeek 真；Kimi 假）",
+check("开关三态·auto：默认放行 CN/INTL+白名单（Qwen/GLM/DeepSeek/Kimi）",
       _auto_cn_qwen is True and _auto_cn_glm is True and _auto_cn_glm2 is True
-      and _auto_cn_ds is True and _auto_cn_kimi is False
+      and _auto_cn_ds is True and _auto_cn_kimi is True
       and _auto_intl_qwen is True,
       (_auto_cn_qwen, _auto_cn_glm, _auto_cn_ds, _auto_cn_kimi, _auto_intl_qwen))
 check("开关三态·on/off：on 强制放行（含 DeepSeek/INTL），off 一律关闭",
