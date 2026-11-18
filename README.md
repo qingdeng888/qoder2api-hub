@@ -100,7 +100,7 @@ curl http://127.0.0.1:8790/v1/chat/completions \
 ```bash
 docker compose pull && docker compose up -d
 # 或指定版本
-docker pull ghcr.io/qingdeng888/qoder2api-hub:1.9.8
+docker pull ghcr.io/qingdeng888/qoder2api-hub:1.9.10
 ```
 
 API Key / 面板密码不要写进仓库：用 shell 环境变量或同目录 `.env` 传入，例如
